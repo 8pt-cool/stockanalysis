@@ -1,0 +1,9 @@
+{
+  "name": "Trade Review Assistant",
+  "short_name": "TradeReview",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f5ef",
+  "theme_color": "#235347",
+  "icons": []
+}

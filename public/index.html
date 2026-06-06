@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#235347" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="stylesheet" href="/styles.css" />
+    <title>交易复盘助手</title>
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Mac mini 私有版</p>
+        <h1>交易复盘助手</h1>
+      </div>
+      <button id="saveSecretBtn" class="iconButton" title="保存密码">保存</button>
+    </header>
+
+    <main>
+      <section class="panel authPanel">
+        <label>
+          访问密码
+          <input id="secretInput" type="password" autocomplete="current-password" placeholder="APP_SECRET" />
+        </label>
+      </section>
+
+      <nav class="tabs" aria-label="主要功能">
+        <button class="tab active" data-tab="today">今日</button>
+        <button class="tab" data-tab="upload">截图</button>
+        <button class="tab" data-tab="watch">自选</button>
+        <button class="tab" data-tab="reports">AI</button>
+      </nav>
+
+      <section id="today" class="tabPage active">
+        <div class="sectionHeader">
+          <h2>今日操作</h2>
+          <button id="refreshTradesBtn">刷新</button>
+        </div>
+        <form id="tradeForm" class="gridForm">
+          <label>日期<input name="trade_date" type="date" /></label>
+          <label>代码<input name="stock_code" inputmode="numeric" placeholder="600519" required /></label>
+          <label>名称<input name="stock_name" placeholder="贵州茅台" /></label>
+          <label>方向
+            <select name="side">
+              <option value="buy">买入</option>
+              <option value="sell">卖出</option>
+            </select>
+          </label>
+          <label>价格<input name="price" type="number" step="0.001" required /></label>
+          <label>数量<input name="quantity" type="number" step="1" required /></label>
+          <label class="wide">理由<textarea name="reason" rows="3" placeholder="计划、情绪、触发条件"></textarea></label>
+          <button type="submit" class="primary wide">保存交易</button>
+        </form>
+        <div id="tradeList" class="list"></div>
+      </section>
+
+      <section id="upload" class="tabPage">
+        <div class="sectionHeader">
+          <h2>截图识别</h2>
+          <button id="refreshScreenshotsBtn">刷新待确认</button>
+        </div>
+        <p class="note">上传前请遮挡账号、手机号、身份证、完整资金账号等敏感信息。</p>
+        <label>
+          识别类型
+          <select id="screenshotType">
+            <option value="auto">自动判断</option>
+            <option value="intraday_sb">日内 S/B 点</option>
+            <option value="broker_records">券商成交记录合集</option>
+            <option value="watchlist_snapshot">自选股列表截图</option>
+          </select>
+        </label>
+        <input id="screenshotInput" type="file" accept="image/*" />
+        <button id="uploadBtn" class="primary">上传并识别</button>
+        <pre id="uploadResult" class="output"></pre>
+        <div class="sectionHeader subsection">
+          <h2>待确认截图</h2>
+        </div>
+        <div id="screenshotList" class="list"></div>
+      </section>
+
+      <section id="watch" class="tabPage">
+        <div class="sectionHeader">
+          <h2>自选股</h2>
+          <button id="refreshWatchBtn">刷新</button>
+        </div>
+        <form id="watchForm" class="gridForm">
+          <label>代码<input name="stock_code" inputmode="numeric" required /></label>
+          <label>名称<input name="stock_name" /></label>
+          <label>策略
+            <select name="strategy_type">
+              <option value="回踩观察">回踩观察</option>
+              <option value="突破确认">突破确认</option>
+              <option value="趋势跟踪">趋势跟踪</option>
+              <option value="低吸观察">低吸观察</option>
+            </select>
+          </label>
+          <label>支撑位<input name="support_price" type="number" step="0.001" /></label>
+          <label>压力位<input name="resistance_price" type="number" step="0.001" /></label>
+          <label>止损位<input name="stop_loss" type="number" step="0.001" /></label>
+          <label class="wide">关注理由<textarea name="reason" rows="3"></textarea></label>
+          <button type="submit" class="primary wide">保存自选</button>
+        </form>
+        <p id="watchStatus" class="note statusLine"></p>
+        <div id="watchList" class="list"></div>
+      </section>
+
+      <section id="reports" class="tabPage">
+        <div class="actions">
+          <button id="reviewBtn" class="primary">生成今日交易复盘</button>
+          <button id="watchReportBtn">生成自选股日报</button>
+        </div>
+        <pre id="aiOutput" class="output"></pre>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
