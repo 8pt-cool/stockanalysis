@@ -148,6 +148,8 @@ def init_db():
               stock_code TEXT NOT NULL UNIQUE,
               stock_name TEXT,
               reason TEXT,
+              sector_name TEXT,
+              sector_rank INTEGER,
               strategy_type TEXT,
               support_price REAL,
               resistance_price REAL,
@@ -184,6 +186,13 @@ def init_db():
         }
         if "imported_at" not in existing_columns:
             conn.execute("ALTER TABLE screenshots ADD COLUMN imported_at TEXT")
+        watch_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(watchlist)")
+        }
+        if "sector_name" not in watch_columns:
+            conn.execute("ALTER TABLE watchlist ADD COLUMN sector_name TEXT")
+        if "sector_rank" not in watch_columns:
+            conn.execute("ALTER TABLE watchlist ADD COLUMN sector_rank INTEGER")
 
 
 def row_to_dict(row):
@@ -751,6 +760,8 @@ def compact_watch_item(item):
     return {
         "code": item.get("stock_code"),
         "name": item.get("stock_name"),
+        "sector": item.get("sector_name"),
+        "rank": item.get("sector_rank"),
         "strategy": item.get("strategy_type"),
         "support": item.get("support_price"),
         "resistance": item.get("resistance_price"),
@@ -790,6 +801,8 @@ def upsert_watch(payload):
         "stock_code": str(payload.get("stock_code") or "").strip(),
         "stock_name": str(payload.get("stock_name") or "").strip(),
         "reason": str(payload.get("reason") or "").strip(),
+        "sector_name": str(payload.get("sector_name") or "").strip(),
+        "sector_rank": as_int(payload.get("sector_rank")),
         "strategy_type": str(payload.get("strategy_type") or "").strip(),
         "support_price": payload.get("support_price") or None,
         "resistance_price": payload.get("resistance_price") or None,
@@ -806,16 +819,20 @@ def upsert_watch(payload):
         conn.execute(
             """
             INSERT INTO watchlist
-            (id, stock_code, stock_name, reason, strategy_type, support_price,
+            (id, stock_code, stock_name, reason, sector_name, sector_rank,
+             strategy_type, support_price,
              resistance_price, target_buy_min, target_buy_max, stop_loss,
              max_position, active, created_at)
             VALUES
-            (:id, :stock_code, :stock_name, :reason, :strategy_type, :support_price,
+            (:id, :stock_code, :stock_name, :reason, :sector_name, :sector_rank,
+             :strategy_type, :support_price,
              :resistance_price, :target_buy_min, :target_buy_max, :stop_loss,
              :max_position, :active, :created_at)
             ON CONFLICT(stock_code) DO UPDATE SET
               stock_name=excluded.stock_name,
               reason=excluded.reason,
+              sector_name=COALESCE(NULLIF(excluded.sector_name, ''), watchlist.sector_name),
+              sector_rank=COALESCE(excluded.sector_rank, watchlist.sector_rank),
               strategy_type=excluded.strategy_type,
               support_price=excluded.support_price,
               resistance_price=excluded.resistance_price,
@@ -894,6 +911,119 @@ def generate_watch_report():
             VALUES (?, ?, ?, ?, ?)
             """,
             (report_id, today_str(), "{}", result["text"], now_iso()),
+        )
+    return result["text"]
+
+
+def sector_watch_groups():
+    groups = {}
+    for item in list_watchlist():
+        sector = item.get("sector_name") or "未分组"
+        groups.setdefault(sector, []).append(item)
+    for items in groups.values():
+        items.sort(key=lambda item: item.get("sector_rank") or 999)
+    return groups
+
+
+def sector_market_snapshot(trade_date=None):
+    trade_date = trade_date or today_str()
+    sectors = []
+    for sector, items in sector_watch_groups().items():
+        if sector == "未分组":
+            continue
+        stocks = []
+        for item in items[:6]:
+            code = item.get("stock_code")
+            if not code:
+                continue
+            context = market_context_for_stock(code, trade_date)
+            compact = compact_market_context(context)
+            compact.update(
+                {
+                    "name": item.get("stock_name"),
+                    "sector_rank": item.get("sector_rank"),
+                }
+            )
+            stocks.append(compact)
+        ok_stocks = [stock for stock in stocks if stock.get("ok")]
+        if not ok_stocks:
+            sectors.append({"sector": sector, "stocks": stocks, "ok": False})
+            continue
+        pct_values = [stock.get("pct") for stock in ok_stocks if stock.get("pct") is not None]
+        above_ma5 = sum(
+            1
+            for stock in ok_stocks
+            if stock.get("close") is not None
+            and stock.get("ma5") is not None
+            and stock["close"] >= stock["ma5"]
+        )
+        above_ma20 = sum(
+            1
+            for stock in ok_stocks
+            if stock.get("close") is not None
+            and stock.get("ma20") is not None
+            and stock["close"] >= stock["ma20"]
+        )
+        near_ma5 = sum(
+            1
+            for stock in ok_stocks
+            if stock.get("close") is not None
+            and stock.get("ma5") is not None
+            and abs(stock["close"] - stock["ma5"]) / stock["ma5"] <= 0.03
+        )
+        sectors.append(
+            {
+                "sector": sector,
+                "ok": True,
+                "stock_count": len(ok_stocks),
+                "avg_pct": round(sum(pct_values) / len(pct_values), 3) if pct_values else None,
+                "above_ma5": above_ma5,
+                "above_ma20": above_ma20,
+                "near_ma5": near_ma5,
+                "stocks": stocks,
+            }
+        )
+    sectors.sort(
+        key=lambda item: (
+            item.get("above_ma5", 0),
+            item.get("near_ma5", 0),
+            item.get("avg_pct") or -999,
+        ),
+        reverse=True,
+    )
+    return sectors
+
+
+def generate_sector_rotation_report(trade_date=None):
+    trade_date = trade_date or today_str()
+    snapshot = sector_market_snapshot(trade_date)
+    prompt = (
+        "你是 A 股 AI 产业链赛道轮动观察助手。不要给确定买入建议，不要承诺收益。\n"
+        "用户关注的是：AI 各细分赛道此消彼长，寻找持续走低后开始企稳、适合后续低吸观察的赛道。\n"
+        "请基于本地 K 线摘要，按以下结构输出：\n"
+        "1. 低位企稳观察赛道：重点找前期弱、但出现站回 MA5/跌幅收窄/量能改善/多只核心股同步修复的赛道。\n"
+        "2. 强势延续但不追赛道：说明强在哪里，以及等什么回踩信号。\n"
+        "3. 仍在走弱赛道：说明为什么暂时不急。\n"
+        "4. 明日观察触发条件：用可执行条件表达，例如“赛道内 top4 至少 2 只站上 MA5”。\n"
+        "请优先按赛道分析，再点名赛道内 top1-top4 核心股票。总字数控制在 1400 字以内。\n"
+        f"日期：{trade_date}\n"
+        f"赛道快照：{json.dumps(snapshot, ensure_ascii=False)}"
+    )
+    result = ai_complete([prompt])
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO daily_stock_reports
+            (id, report_date, market_data_json, ai_summary, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                trade_date,
+                json.dumps({"type": "sector_rotation", "snapshot": snapshot}, ensure_ascii=False),
+                result["text"],
+                now_iso(),
+            ),
         )
     return result["text"]
 
@@ -1895,7 +2025,12 @@ def import_watchlist_from_screenshot(payload):
                 {
                     "stock_code": stock_code,
                     "stock_name": stock_name,
-                    "reason": f"截图导入 涨跌幅:{item.get('pct_change')} 现价:{item.get('last_price')}",
+                    "reason": (
+                        f"截图导入 板块:{item.get('board')} 排名:top{item.get('rank')} "
+                        f"涨跌幅:{item.get('pct_change')} 现价:{item.get('last_price')}"
+                    ),
+                    "sector_name": item.get("board") or "",
+                    "sector_rank": item.get("rank"),
                     "strategy_type": "回踩观察",
                 }
             )
@@ -2045,6 +2180,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/watch-report":
                 json_response(self, {"ok": True, "report": generate_watch_report()})
+                return
+            if self.path == "/api/sector-report":
+                trade_date = payload.get("date") or today_str()
+                json_response(
+                    self,
+                    {"ok": True, "report": generate_sector_rotation_report(trade_date)},
+                )
                 return
             if self.path == "/api/import-screenshot-trades":
                 json_response(self, {"ok": True, **import_screenshot_trades(payload)})
@@ -2275,6 +2417,7 @@ def telegram_help_text():
         "/review 生成昨天交易复盘\n"
         "/review today 生成今天交易复盘\n"
         "/report 生成自选股日报\n"
+        "/sector 生成 AI 赛道轮动报告\n"
         "/watch 代码 名称 加入自选\n"
         "/list 查看自选股\n"
         "/reload 重新解析最近一张截图"
@@ -2333,6 +2476,9 @@ def handle_telegram_message(message):
     elif text.startswith("/report"):
         telegram_send(chat_id, "开始生成自选股日报，请稍等。")
         telegram_send(chat_id, generate_watch_report())
+    elif text.startswith("/sector"):
+        telegram_send(chat_id, "开始生成 AI 赛道轮动报告，请稍等。")
+        telegram_send(chat_id, generate_sector_rotation_report())
     elif message.get("photo"):
         photos = message["photo"]
         largest = max(photos, key=lambda item: item.get("file_size", 0))

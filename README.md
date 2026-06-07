@@ -81,12 +81,14 @@ works.
 - Watchlist CRUD
 - AKShare daily K-line context for trade reviews
 - Daily watchlist report generation hook
+- AI sector rotation report for sector/top-ranked watchlist screenshots
 - Telegram bot polling:
   - `/start`
   - `/today`
   - `/list`
   - `/watch 600519 贵州茅台`
   - `/report`
+  - `/sector`
   - photo upload
 - Optional daily Telegram watchlist report with `TELEGRAM_REPORT_CHAT_ID` and
   `DAILY_REPORT_TIME`
@@ -100,6 +102,11 @@ The upload page supports three recognition modes:
 - `broker_records`: broker app trade record lists.
 - `watchlist_snapshot`: watchlist screenshots with stock names, codes, percent
   changes, and latest prices.
+
+Sector/top-ranked screenshots, such as AI infrastructure subsector maps, are
+stored with `sector_name` and `sector_rank`. Use `/sector` in Telegram or
+`POST /api/sector-report` to generate a sector rotation report focused on
+weak-but-stabilizing subsectors and low-absorption watch candidates.
 
 For Telegram photo uploads, add a caption to force the mode:
 
