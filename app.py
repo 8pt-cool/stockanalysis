@@ -925,6 +925,70 @@ def sector_watch_groups():
     return groups
 
 
+def estimate_sector_kelly(ok_stocks, above_ma5, above_ma20, near_ma5, avg_pct):
+    total = max(len(ok_stocks), 1)
+    ma5_ratio = above_ma5 / total
+    ma20_ratio = above_ma20 / total
+    near_ma5_ratio = near_ma5 / total
+    volume_values = [
+        stock.get("vol20")
+        for stock in ok_stocks
+        if isinstance(stock.get("vol20"), (int, float))
+    ]
+    avg_vol20 = sum(volume_values) / len(volume_values) if volume_values else 1.0
+
+    win_rate = 0.32
+    win_rate += 0.18 * ma5_ratio
+    win_rate += 0.12 * ma20_ratio
+    win_rate += 0.08 * near_ma5_ratio
+    if avg_pct is not None:
+        if -2.5 <= avg_pct <= 1.5:
+            win_rate += 0.06
+        elif avg_pct > 4:
+            win_rate -= 0.05
+        elif avg_pct < -5:
+            win_rate -= 0.08
+        elif avg_pct < -3:
+            win_rate -= 0.04
+    if 0.8 <= avg_vol20 <= 1.8:
+        win_rate += 0.04
+    elif avg_vol20 > 2.5:
+        win_rate -= 0.04
+    win_rate = min(max(win_rate, 0.15), 0.56)
+
+    payoff_ratio = 1.2
+    payoff_ratio += 0.55 * ma20_ratio
+    payoff_ratio += 0.35 * near_ma5_ratio
+    if avg_pct is not None:
+        if avg_pct < -4:
+            payoff_ratio += 0.1
+        elif avg_pct > 5:
+            payoff_ratio -= 0.25
+    payoff_ratio = min(max(payoff_ratio, 0.8), 3.0)
+
+    full_kelly = win_rate - (1 - win_rate) / payoff_ratio if payoff_ratio > 0 else 0
+    full_kelly = max(full_kelly, 0)
+    conservative_kelly = full_kelly * 0.25
+    conservative_cap = min(conservative_kelly, 0.05)
+    if conservative_cap < 0.015:
+        level = "只看不动"
+    elif conservative_cap < 0.04:
+        level = "轻仓观察"
+    elif conservative_cap < 0.045:
+        level = "标准观察"
+    else:
+        level = "高质量轻仓观察"
+    return {
+        "estimated_win_rate": round(win_rate, 3),
+        "estimated_payoff_ratio": round(payoff_ratio, 3),
+        "full_kelly": round(full_kelly, 4),
+        "quarter_kelly": round(conservative_kelly, 4),
+        "conservative_position_cap": round(conservative_cap, 4),
+        "position_level": level,
+        "method": "rule_based_quarter_kelly",
+    }
+
+
 def sector_market_snapshot(trade_date=None):
     trade_date = trade_date or today_str()
     sectors = []
@@ -971,15 +1035,18 @@ def sector_market_snapshot(trade_date=None):
             and stock.get("ma5") is not None
             and abs(stock["close"] - stock["ma5"]) / stock["ma5"] <= 0.03
         )
+        avg_pct = round(sum(pct_values) / len(pct_values), 3) if pct_values else None
+        kelly = estimate_sector_kelly(ok_stocks, above_ma5, above_ma20, near_ma5, avg_pct)
         sectors.append(
             {
                 "sector": sector,
                 "ok": True,
                 "stock_count": len(ok_stocks),
-                "avg_pct": round(sum(pct_values) / len(pct_values), 3) if pct_values else None,
+                "avg_pct": avg_pct,
                 "above_ma5": above_ma5,
                 "above_ma20": above_ma20,
                 "near_ma5": near_ma5,
+                "kelly": kelly,
                 "stocks": stocks,
             }
         )
@@ -1004,7 +1071,9 @@ def generate_sector_rotation_report(trade_date=None):
         "1. 低位企稳观察赛道：重点找前期弱、但出现站回 MA5/跌幅收窄/量能改善/多只核心股同步修复的赛道。\n"
         "2. 强势延续但不追赛道：说明强在哪里，以及等什么回踩信号。\n"
         "3. 仍在走弱赛道：说明为什么暂时不急。\n"
-        "4. 明日观察触发条件：用可执行条件表达，例如“赛道内 top4 至少 2 只站上 MA5”。\n"
+        "4. 凯利仓位参考：使用赛道快照里的 kelly 字段，只输出保守仓位上限，不输出满仓建议；"
+        "请说明这是规则估算，不是确定胜率。\n"
+        "5. 明日观察触发条件：用可执行条件表达，例如“赛道内 top4 至少 2 只站上 MA5”。\n"
         "请优先按赛道分析，再点名赛道内 top1-top4 核心股票。总字数控制在 1400 字以内。\n"
         f"日期：{trade_date}\n"
         f"赛道快照：{json.dumps(snapshot, ensure_ascii=False)}"
