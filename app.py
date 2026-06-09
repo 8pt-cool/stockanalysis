@@ -777,6 +777,8 @@ def compact_market_context(context):
         return {
             "ok": False,
             "stock_code": context.get("stock_code"),
+            "code": context.get("stock_code"),
+            "date": context.get("k_date"),
             "error": context.get("error"),
         }
     return {
@@ -883,26 +885,45 @@ def generate_trade_review(trade_date):
     return result["text"]
 
 
-def generate_watch_report():
+def generate_watch_report(report_date=None):
     watch_items = list_watchlist()
+    report_date = report_date or today_str()
     market_context = [
-        market_context_for_stock(item["stock_code"], today_str())
+        market_context_for_stock(item["stock_code"], report_date)
         for item in watch_items
         if item.get("stock_code")
     ]
     compact_items = [compact_watch_item(item) for item in watch_items]
     compact_context = [compact_market_context(item) for item in market_context]
+    ok_context = [item for item in compact_context if item.get("ok")]
+    missing_context = [item for item in compact_context if not item.get("ok")]
+    coverage = {
+        "total": len(compact_context),
+        "ok": len(ok_context),
+        "missing": len(missing_context),
+        "missing_items": missing_context,
+    }
     prompt = (
         "你是一个自选股盘后观察助手。不要给直接买入建议，不要预测确定收益。\n"
-        "基于用户预设条件和本地计算的 K 线摘要，按三类输出：重点观察、继续跟踪、暂时回避。\n"
-        "如果某只股票行情数据缺失，请明确说明，不要猜测走势。\n"
-        "请精简输出，每只股票最多 3 条要点，总字数控制在 1200 字以内。\n"
-        f"日期：{today_str()}\n"
+        "基于用户预设条件和本地计算的 K 线摘要输出盘后观察。\n"
+        "请第一行明确写出行情覆盖率，例如“行情覆盖：82/82”。\n"
+        "如果缺失行情，只列出缺失股票；如果未缺失，请明确说明“未详细展开的股票不代表数据缺失”。\n"
+        "不要逐股平铺全部自选股，先筛选最值得明日观察的 8-12 只，再按三类输出：重点观察、继续跟踪、暂时回避。\n"
+        "每个入选股票说明具体依据：涨跌幅、MA5/MA10/MA20、量能相对 20 日均量、是否有企稳/过热/破位迹象。\n"
+        "总字数控制在 1400 字以内。\n"
+        f"日期：{report_date}\n"
+        f"行情覆盖：{json.dumps(coverage, ensure_ascii=False)}\n"
         f"自选股：{json.dumps(compact_items, ensure_ascii=False)}\n"
         f"K线摘要：{json.dumps(compact_context, ensure_ascii=False)}"
     )
     result = ai_complete([prompt])
     report_id = str(uuid.uuid4())
+    market_data = {
+        "type": "watch_report",
+        "coverage": coverage,
+        "watch_items": compact_items,
+        "market_context": compact_context,
+    }
     with db() as conn:
         conn.execute(
             """
@@ -910,7 +931,13 @@ def generate_watch_report():
             (id, report_date, market_data_json, ai_summary, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (report_id, today_str(), "{}", result["text"], now_iso()),
+            (
+                report_id,
+                report_date,
+                json.dumps(market_data, ensure_ascii=False),
+                result["text"],
+                now_iso(),
+            ),
         )
     return result["text"]
 
@@ -2248,7 +2275,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 json_response(self, {"ok": True, "review": generate_trade_review(trade_date)})
                 return
             if self.path == "/api/watch-report":
-                json_response(self, {"ok": True, "report": generate_watch_report()})
+                report_date = payload.get("date") or payload.get("report_date") or today_str()
+                json_response(self, {"ok": True, "report": generate_watch_report(report_date)})
                 return
             if self.path == "/api/sector-report":
                 trade_date = payload.get("date") or today_str()
@@ -2486,11 +2514,26 @@ def telegram_help_text():
         "/review 生成昨天交易复盘\n"
         "/review today 生成今天交易复盘\n"
         "/report 生成自选股日报\n"
+        "/report yesterday 重算昨天自选股日报\n"
         "/sector 生成 AI 赛道轮动报告\n"
         "/watch 代码 名称 加入自选\n"
         "/list 查看自选股\n"
         "/reload 重新解析最近一张截图"
     )
+
+
+def parse_telegram_date_arg(text, default_date):
+    parts = text.split(maxsplit=1)
+    if len(parts) <= 1:
+        return default_date
+    arg = parts[1].strip().lower()
+    if arg in ("today", "今天"):
+        return today_str()
+    if arg in ("yesterday", "昨天"):
+        return yesterday_str()
+    if re.match(r"\d{4}-\d{2}-\d{2}", arg):
+        return arg[:10]
+    return default_date
 
 
 def handle_telegram_message(message):
@@ -2516,16 +2559,7 @@ def handle_telegram_message(message):
     elif text.startswith("/yesterday"):
         telegram_send(chat_id, format_trades_for_telegram(yesterday_str()))
     elif text.startswith("/review"):
-        parts = text.split(maxsplit=1)
-        target = yesterday_str()
-        if len(parts) > 1:
-            arg = parts[1].strip().lower()
-            if arg in ("today", "今天"):
-                target = today_str()
-            elif arg in ("yesterday", "昨天"):
-                target = yesterday_str()
-            elif re.match(r"\d{4}-\d{2}-\d{2}", arg):
-                target = arg[:10]
+        target = parse_telegram_date_arg(text, yesterday_str())
         telegram_send(chat_id, f"开始生成 {target} 交易复盘，请稍等。")
         telegram_send(chat_id, generate_trade_review(target))
     elif text.startswith("/list"):
@@ -2543,8 +2577,9 @@ def handle_telegram_message(message):
         upsert_watch(payload)
         telegram_send(chat_id, f"已加入自选：{payload['stock_code']} {payload['stock_name']}")
     elif text.startswith("/report"):
-        telegram_send(chat_id, "开始生成自选股日报，请稍等。")
-        telegram_send(chat_id, generate_watch_report())
+        target = parse_telegram_date_arg(text, today_str())
+        telegram_send(chat_id, f"开始生成 {target} 自选股日报，请稍等。")
+        telegram_send(chat_id, generate_watch_report(target))
     elif text.startswith("/sector"):
         telegram_send(chat_id, "开始生成 AI 赛道轮动报告，请稍等。")
         telegram_send(chat_id, generate_sector_rotation_report())
