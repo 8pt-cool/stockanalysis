@@ -897,16 +897,27 @@ def generate_watch_report(report_date=None):
     compact_context = [compact_market_context(item) for item in market_context]
     ok_context = [item for item in compact_context if item.get("ok")]
     missing_context = [item for item in compact_context if not item.get("ok")]
+    stale_context = [
+        item
+        for item in ok_context
+        if item.get("date") and item.get("date") != report_date
+    ]
+    data_dates = sorted({item.get("date") for item in ok_context if item.get("date")})
     coverage = {
         "total": len(compact_context),
         "ok": len(ok_context),
         "missing": len(missing_context),
         "missing_items": missing_context,
+        "data_dates": data_dates,
+        "stale": len(stale_context),
+        "stale_items": stale_context,
     }
     prompt = (
         "你是一个自选股盘后观察助手。不要给直接买入建议，不要预测确定收益。\n"
         "基于用户预设条件和本地计算的 K 线摘要输出盘后观察。\n"
         "请第一行明确写出行情覆盖率，例如“行情覆盖：82/82”。\n"
+        "请第二行明确写出行情实际日期。如果行情实际日期早于报告日期，必须说明“当前数据源尚未更新到报告日期”，"
+        "并且不要把旧日期数据表述为今日涨跌。\n"
         "如果缺失行情，只列出缺失股票；如果未缺失，请明确说明“未详细展开的股票不代表数据缺失”。\n"
         "不要逐股平铺全部自选股，先筛选最值得明日观察的 8-12 只，再按三类输出：重点观察、继续跟踪、暂时回避。\n"
         "每个入选股票说明具体依据：涨跌幅、MA5/MA10/MA20、量能相对 20 日均量、是否有企稳/过热/破位迹象。\n"
