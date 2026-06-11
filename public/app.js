@@ -265,18 +265,20 @@ function initForms() {
 
   $("#reviewBtn").addEventListener("click", async () => {
     setOutput("#aiOutput", "生成中...");
+    const reportDate = $("#reportDate").value || today();
     const data = await api("/api/review", {
       method: "POST",
-      body: JSON.stringify({ trade_date: today() }),
+      body: JSON.stringify({ trade_date: reportDate }),
     });
     setOutput("#aiOutput", data.review);
   });
 
   $("#watchReportBtn").addEventListener("click", async () => {
     setOutput("#aiOutput", "生成中...");
+    const reportDate = $("#reportDate").value || today();
     const data = await api("/api/watch-report", {
       method: "POST",
-      body: JSON.stringify({}),
+      body: JSON.stringify({ report_date: reportDate }),
     });
     setOutput("#aiOutput", data.report);
   });
@@ -378,6 +380,7 @@ function initForms() {
 async function init() {
   initTabs();
   initForms();
+  $("#reportDate").value = today();
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
   }

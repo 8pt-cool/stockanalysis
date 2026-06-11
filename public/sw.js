@@ -1,6 +1,6 @@
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open("trade-review-v5").then((cache) =>
+    caches.open("trade-review-v6").then((cache) =>
       cache.addAll(["/", "/index.html", "/styles.css", "/app.js", "/manifest.json"])
     )
   );
