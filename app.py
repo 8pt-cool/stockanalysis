@@ -63,6 +63,7 @@ LOCAL_AI_SUPPORTS_IMAGES = os.getenv("LOCAL_AI_SUPPORTS_IMAGES", "false").lower(
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ALLOWED_USER_ID = os.getenv("TELEGRAM_ALLOWED_USER_ID", "")
 TELEGRAM_REPORT_CHAT_ID = os.getenv("TELEGRAM_REPORT_CHAT_ID", "")
+TELEGRAM_SUBSCRIBER_CHAT_IDS = os.getenv("TELEGRAM_SUBSCRIBER_CHAT_IDS", "")
 DAILY_REPORT_TIME = os.getenv("DAILY_REPORT_TIME", "15:30")
 MARKET_DATA_PROVIDER = os.getenv("MARKET_DATA_PROVIDER", "akshare").strip().lower()
 MARKET_LOOKBACK_DAYS = int(os.getenv("MARKET_LOOKBACK_DAYS", "90"))
@@ -177,6 +178,17 @@ def init_db():
               stock_name TEXT PRIMARY KEY,
               stock_code TEXT NOT NULL,
               source TEXT,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS telegram_subscribers (
+              chat_id TEXT PRIMARY KEY,
+              user_id TEXT,
+              username TEXT,
+              first_name TEXT,
+              last_name TEXT,
+              active INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
             """
@@ -2514,6 +2526,85 @@ def allowed_telegram_user(message):
     return str(user.get("id")) == str(TELEGRAM_ALLOWED_USER_ID)
 
 
+def is_telegram_owner(message):
+    return allowed_telegram_user(message)
+
+
+def register_telegram_subscriber(message, active=1):
+    chat = message.get("chat") or {}
+    user = message.get("from") or {}
+    chat_id = str(chat.get("id") or "")
+    if not chat_id:
+        return None
+    now = now_iso()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO telegram_subscribers
+            (chat_id, user_id, username, first_name, last_name, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+              user_id=excluded.user_id,
+              username=excluded.username,
+              first_name=excluded.first_name,
+              last_name=excluded.last_name,
+              active=excluded.active,
+              updated_at=excluded.updated_at
+            """,
+            (
+                chat_id,
+                str(user.get("id") or ""),
+                str(user.get("username") or ""),
+                str(user.get("first_name") or ""),
+                str(user.get("last_name") or ""),
+                active,
+                now,
+                now,
+            ),
+        )
+    return chat_id
+
+
+def list_telegram_subscriber_chat_ids():
+    chat_ids = []
+    for raw in TELEGRAM_SUBSCRIBER_CHAT_IDS.split(","):
+        value = raw.strip()
+        if value:
+            chat_ids.append(value)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM telegram_subscribers WHERE active=1 ORDER BY created_at"
+        ).fetchall()
+    chat_ids.extend(str(row["chat_id"]) for row in rows)
+    return chat_ids
+
+
+def telegram_report_recipient_ids():
+    recipients = []
+    if TELEGRAM_REPORT_CHAT_ID:
+        recipients.append(str(TELEGRAM_REPORT_CHAT_ID))
+    recipients.extend(list_telegram_subscriber_chat_ids())
+    seen = set()
+    unique = []
+    for chat_id in recipients:
+        if chat_id and chat_id not in seen:
+            unique.append(chat_id)
+            seen.add(chat_id)
+    return unique
+
+
+def telegram_broadcast_report(text):
+    sent = []
+    failed = []
+    for chat_id in telegram_report_recipient_ids():
+        try:
+            telegram_send(chat_id, text)
+            sent.append(chat_id)
+        except Exception as exc:
+            failed.append({"chat_id": chat_id, "error": str(exc)})
+    return {"sent": sent, "failed": failed}
+
+
 def telegram_help_text():
     return (
         "可用指令：\n"
@@ -2549,10 +2640,16 @@ def parse_telegram_date_arg(text, default_date):
 
 def handle_telegram_message(message):
     chat_id = message["chat"]["id"]
-    if not allowed_telegram_user(message):
-        telegram_send(chat_id, "未授权用户。")
-        return
     text = (message.get("text") or "").strip()
+    if not is_telegram_owner(message):
+        if text.startswith("/stop"):
+            register_telegram_subscriber(message, active=0)
+            telegram_send(chat_id, "已取消每日 17:30 自选股日报订阅。")
+            return
+        register_telegram_subscriber(message, active=1)
+        if text.startswith("/start") or text.startswith("/subscribe"):
+            telegram_send(chat_id, "已订阅每日 17:30 自选股日报。这个机器人不开放指令操作。")
+        return
     if text.startswith("/start"):
         telegram_send(chat_id, "交易复盘助手已启动。\n\n" + telegram_help_text())
     elif text.startswith("/help"):
@@ -2616,7 +2713,7 @@ def handle_telegram_message(message):
 
 
 def daily_report_loop():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_REPORT_CHAT_ID or not DAILY_REPORT_TIME:
+    if not TELEGRAM_BOT_TOKEN or not DAILY_REPORT_TIME:
         return
     last_sent = ""
     while True:
@@ -2624,7 +2721,10 @@ def daily_report_loop():
         stamp = current.strftime("%Y-%m-%d %H:%M")
         if current.strftime("%H:%M") == DAILY_REPORT_TIME and last_sent != stamp:
             try:
-                telegram_send(TELEGRAM_REPORT_CHAT_ID, generate_watch_report())
+                report = generate_watch_report()
+                result = telegram_broadcast_report(report)
+                if result["failed"]:
+                    print(f"Daily report partial failure: {result['failed']}")
                 last_sent = stamp
             except Exception as exc:
                 print(f"Daily report error: {exc}")
