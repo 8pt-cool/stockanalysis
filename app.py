@@ -587,11 +587,30 @@ def fetch_tushare_daily(stock_code, end_date, lookback_days=MARKET_LOOKBACK_DAYS
             start_date=start.strftime("%Y%m%d"),
             end_date=end.strftime("%Y%m%d"),
         )
+        adj = pro.adj_factor(
+            ts_code=tushare_ts_code(stock_code),
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+        )
     except Exception as exc:
         return {"ok": False, "error": f"Tushare 拉取失败：{exc}"}
     if frame is None or frame.empty:
         return {"ok": False, "error": f"Tushare 未返回 {stock_code} 的日 K 数据"}
-    return {"ok": True, "frame": normalize_tushare_frame(frame), "provider": "tushare"}
+    frame = normalize_tushare_frame(frame)
+    if adj is not None and not adj.empty:
+        adj = adj.rename(columns={"trade_date": "日期"}).copy()
+        adj["日期"] = adj["日期"].astype(str).str.replace(
+            r"(\d{4})(\d{2})(\d{2})", r"\1-\2-\3", regex=True
+        )
+        adj = adj.sort_values("日期")
+        frame = frame.merge(adj[["日期", "adj_factor"]], on="日期", how="left")
+        latest_adj = frame["adj_factor"].dropna().iloc[-1] if frame["adj_factor"].notna().any() else None
+        if latest_adj:
+            ratio = frame["adj_factor"] / latest_adj
+            for col in ("开盘", "收盘", "最高", "最低"):
+                if col in frame.columns:
+                    frame[col] = frame[col].astype(float) * ratio
+    return {"ok": True, "frame": frame, "provider": "tushare_qfq"}
 
 
 def fetch_akshare_daily(stock_code, end_date, lookback_days=MARKET_LOOKBACK_DAYS):
