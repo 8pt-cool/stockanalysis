@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import concurrent.futures
 import datetime as dt
 import json
 import os
@@ -733,6 +734,12 @@ def market_context_for_stock(stock_code, trade_date, trades=None):
     open_price = as_number(latest.get("开盘"))
     volume = as_number(latest.get("成交量"))
     volume_20_avg = mean(volumes[-20:])
+    prev_close = closes[-2] if len(closes) >= 2 else None
+    pct_change = (
+        round((close - prev_close) / prev_close * 100, 4)
+        if close is not None and prev_close not in (None, 0)
+        else as_number(latest.get("涨跌幅"))
+    )
 
     trade_points = []
     for trade in trades or []:
@@ -760,7 +767,7 @@ def market_context_for_stock(stock_code, trade_date, trades=None):
         "high": high,
         "low": low,
         "close": close,
-        "pct_change": as_number(latest.get("涨跌幅")),
+        "pct_change": pct_change,
         "volume": volume,
         "amount": as_number(latest.get("成交额")),
         "turnover_rate": as_number(latest.get("换手率")),
@@ -916,14 +923,23 @@ def generate_trade_review(trade_date):
     return result["text"]
 
 
+def watch_market_contexts(watch_items, report_date):
+    items = [item for item in watch_items if item.get("stock_code")]
+    if not items:
+        return []
+
+    def load(item):
+        return market_context_for_stock(item["stock_code"], report_date)
+
+    max_workers = min(12, max(1, len(items)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        return list(pool.map(load, items))
+
+
 def generate_watch_report(report_date=None):
     watch_items = list_watchlist()
     report_date = report_date or today_str()
-    market_context = [
-        market_context_for_stock(item["stock_code"], report_date)
-        for item in watch_items
-        if item.get("stock_code")
-    ]
+    market_context = watch_market_contexts(watch_items, report_date)
     compact_items = [compact_watch_item(item) for item in watch_items]
     compact_context = [compact_market_context(item) for item in market_context]
     ok_context = [item for item in compact_context if item.get("ok")]
@@ -952,6 +968,7 @@ def generate_watch_report(report_date=None):
         "如果缺失行情，只列出缺失股票；如果未缺失，请明确说明“未详细展开的股票不代表数据缺失”。\n"
         "不要逐股平铺全部自选股，先筛选最值得明日观察的 8-12 只，再按三类输出：重点观察、继续跟踪、暂时回避。\n"
         "每个入选股票说明具体依据：涨跌幅、MA5/MA10/MA20、量能相对 20 日均量、是否有企稳/过热/破位迹象。\n"
+        "请直接使用提供的精确数值，不要写“估算”“约”“大约”。\n"
         "总字数控制在 1400 字以内。\n"
         f"日期：{report_date}\n"
         f"行情覆盖：{json.dumps(coverage, ensure_ascii=False)}\n"
