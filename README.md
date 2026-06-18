@@ -173,6 +173,39 @@ If GitHub starts asking for credentials again, use a PAT with write access to
 `8pt-cool/stockanalysis`, then run one normal `git push`. Git will store the
 credential in Keychain for later pushes.
 
+## Auto Start on macOS
+
+This app can run at login and restart automatically with `launchd`.
+
+Template:
+
+```text
+scripts/com.charleszhang.stockanalysis.plist
+```
+
+Install:
+
+```sh
+mkdir -p ~/Library/LaunchAgents
+cp scripts/com.charleszhang.stockanalysis.plist ~/Library/LaunchAgents/
+launchctl unload ~/Library/LaunchAgents/com.charleszhang.stockanalysis.plist 2>/dev/null || true
+launchctl load ~/Library/LaunchAgents/com.charleszhang.stockanalysis.plist
+launchctl start com.charleszhang.stockanalysis
+```
+
+After code changes, redeploy and restart with:
+
+```sh
+./scripts/deploy_launchd.sh
+```
+
+Useful checks:
+
+```sh
+launchctl list | grep stockanalysis
+curl -s http://127.0.0.1:8765/api/health
+```
+
 ## Privacy Notes
 
 - Do not upload screenshots that include account numbers, ID numbers, phone
