@@ -50,9 +50,10 @@ LOCAL_AI_SUPPORTS_IMAGES=true
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_ALLOWED_USER_ID=
 TELEGRAM_REPORT_CHAT_ID=
-DAILY_REPORT_TIME=15:30
+TELEGRAM_SUBSCRIBER_CHAT_IDS=
+DAILY_REPORT_TIME=17:30
 
-MARKET_DATA_PROVIDER=akshare
+MARKET_DATA_PROVIDER=tushare
 MARKET_LOOKBACK_DAYS=90
 ```
 
@@ -153,6 +154,24 @@ The app calculates:
 - each trade price position inside the day range
 
 The AI receives this compact market summary instead of raw K-line tables.
+
+## Git Push
+
+This Mac is configured to use the macOS Keychain for Git credentials:
+
+```sh
+git config --global credential.helper osxkeychain
+```
+
+Normal pushes should use:
+
+```sh
+git push origin main
+```
+
+If GitHub starts asking for credentials again, use a PAT with write access to
+`8pt-cool/stockanalysis`, then run one normal `git push`. Git will store the
+credential in Keychain for later pushes.
 
 ## Privacy Notes
 
