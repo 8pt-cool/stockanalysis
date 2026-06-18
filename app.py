@@ -936,10 +936,89 @@ def watch_market_contexts(watch_items, report_date):
         return list(pool.map(load, items))
 
 
+def latest_watch_report_before(report_date):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT report_date, created_at, market_data_json, ai_summary
+            FROM daily_stock_reports
+            WHERE report_date < ?
+            ORDER BY report_date DESC, created_at DESC
+            LIMIT 20
+            """,
+            (report_date,),
+        ).fetchall()
+    for row in rows:
+        try:
+            market_data = json.loads(row["market_data_json"] or "{}")
+        except Exception:
+            market_data = {}
+        if market_data.get("type") == "watch_report":
+            return {
+                "report_date": row["report_date"],
+                "created_at": row["created_at"],
+                "market_data": market_data,
+                "ai_summary": row["ai_summary"] or "",
+            }
+    return None
+
+
+def extract_focus_codes_from_report_text(text):
+    if not text:
+        return []
+    start = text.find("重点观察")
+    if start < 0:
+        return []
+    end_candidates = [
+        idx
+        for idx in (
+            text.find("继续跟踪", start + 1),
+            text.find("暂时回避", start + 1),
+        )
+        if idx >= 0
+    ]
+    end = min(end_candidates) if end_candidates else len(text)
+    section = text[start:end]
+    seen = set()
+    items = []
+    for match in re.finditer(r"([A-Za-z0-9\u4e00-\u9fff\-]+)\s*\((\d{6})\)", section):
+        name = match.group(1).strip("* ").strip()
+        code = match.group(2)
+        if code in seen:
+            continue
+        seen.add(code)
+        items.append({"code": code, "name": name})
+    return items
+
+
+def previous_focus_review(report_date):
+    previous = latest_watch_report_before(report_date)
+    if not previous:
+        return None
+    focus_items = extract_focus_codes_from_report_text(previous.get("ai_summary") or "")
+    if not focus_items:
+        return {
+            "previous_report_date": previous["report_date"],
+            "focus_items": [],
+            "today_context": [],
+        }
+    today_context = []
+    for item in focus_items[:12]:
+        context = compact_market_context(market_context_for_stock(item["code"], report_date))
+        context.update({"name": item.get("name")})
+        today_context.append(context)
+    return {
+        "previous_report_date": previous["report_date"],
+        "focus_items": focus_items[:12],
+        "today_context": today_context,
+    }
+
+
 def generate_watch_report(report_date=None):
     watch_items = list_watchlist()
     report_date = report_date or today_str()
     market_context = watch_market_contexts(watch_items, report_date)
+    focus_review = previous_focus_review(report_date)
     compact_items = [compact_watch_item(item) for item in watch_items]
     compact_context = [compact_market_context(item) for item in market_context]
     ok_context = [item for item in compact_context if item.get("ok")]
@@ -965,6 +1044,7 @@ def generate_watch_report(report_date=None):
         "请第一行明确写出行情覆盖率，例如“行情覆盖：82/82”。\n"
         "请第二行明确写出行情实际日期。如果行情实际日期早于报告日期，必须说明“当前数据源尚未更新到报告日期”，"
         "并且不要把旧日期数据表述为今日涨跌。\n"
+        "如果提供了昨日重点关注回顾，请先输出“昨日重点关注回顾”小节，简明说明昨天重点票今天哪些兑现、哪些转弱、哪些继续观察。\n"
         "如果缺失行情，只列出缺失股票；如果未缺失，请明确说明“未详细展开的股票不代表数据缺失”。\n"
         "不要逐股平铺全部自选股，先筛选最值得明日观察的 8-12 只，再按三类输出：重点观察、继续跟踪、暂时回避。\n"
         "每个入选股票说明具体依据：涨跌幅、MA5/MA10/MA20、量能相对 20 日均量、是否有企稳/过热/破位迹象。\n"
@@ -972,6 +1052,7 @@ def generate_watch_report(report_date=None):
         "总字数控制在 1400 字以内。\n"
         f"日期：{report_date}\n"
         f"行情覆盖：{json.dumps(coverage, ensure_ascii=False)}\n"
+        f"昨日重点关注回顾数据：{json.dumps(focus_review, ensure_ascii=False)}\n"
         f"自选股：{json.dumps(compact_items, ensure_ascii=False)}\n"
         f"K线摘要：{json.dumps(compact_context, ensure_ascii=False)}"
     )
@@ -980,6 +1061,7 @@ def generate_watch_report(report_date=None):
     market_data = {
         "type": "watch_report",
         "coverage": coverage,
+        "previous_focus_review": focus_review,
         "watch_items": compact_items,
         "market_context": compact_context,
     }
