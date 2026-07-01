@@ -545,6 +545,29 @@ def tushare_ts_code(stock_code):
     return f"{code}.SZ"
 
 
+def is_china_market_trading_day(value):
+    trade_date = str(value or today_str())
+    cal_date = yyyymmdd(trade_date)
+    if TUSHARE_TOKEN:
+        try:
+            import tushare as ts
+
+            pro = ts.pro_api(TUSHARE_TOKEN)
+            frame = pro.trade_cal(
+                exchange="",
+                start_date=cal_date,
+                end_date=cal_date,
+                fields="cal_date,is_open",
+            )
+            if frame is not None and not frame.empty:
+                return int(frame.iloc[0]["is_open"]) == 1
+        except Exception as exc:
+            print(f"Trading calendar check failed, falling back to K-line date: {exc}")
+
+    context = market_context_for_stock("000001", trade_date)
+    return bool(context.get("ok") and context.get("k_date") == trade_date)
+
+
 def normalize_tushare_frame(frame):
     if frame is None or frame.empty:
         return frame
@@ -963,39 +986,80 @@ def latest_watch_report_before(report_date):
     return None
 
 
+def extract_focus_items_from_market_data(market_data):
+    if not isinstance(market_data, dict):
+        return []
+    for key in ("focus_items", "selected_focus_items"):
+        items = market_data.get(key)
+        if isinstance(items, list) and items:
+            normalized = []
+            seen = set()
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                code = compact_stock_code(item.get("code") or item.get("stock_code"))
+                if not code or code in seen:
+                    continue
+                seen.add(code)
+                normalized.append({"code": code, "name": item.get("name") or item.get("stock_name")})
+            if normalized:
+                return normalized
+    return []
+
+
 def extract_focus_codes_from_report_text(text):
     if not text:
         return []
-    start = text.find("重点观察")
-    if start < 0:
+    start_match = re.search(r"(?:#{1,6}\s*)?(?:\*\*)?重点观察(?:\*\*)?", text)
+    if not start_match:
         return []
-    end_candidates = [
-        idx
-        for idx in (
-            text.find("继续跟踪", start + 1),
-            text.find("暂时回避", start + 1),
-        )
-        if idx >= 0
-    ]
-    end = min(end_candidates) if end_candidates else len(text)
+    start = start_match.start()
+    end_match = re.search(r"(?:#{1,6}\s*)?(?:\*\*)?(?:继续跟踪|暂时回避)(?:\*\*)?", text[start + 1 :])
+    end = start + 1 + end_match.start() if end_match else len(text)
     section = text[start:end]
     seen = set()
     items = []
-    for match in re.finditer(r"([A-Za-z0-9\u4e00-\u9fff\-]+)\s*\((\d{6})\)", section):
-        name = match.group(1).strip("* ").strip()
-        code = match.group(2)
+    patterns = [
+        r"(?:^|\n)\s*(?:[-*]\s*)?(?:\d+[.)、]\s*)?\*{0,2}\s*([A-Za-z0-9\u4e00-\u9fff\-\s]+?)\s*[\(（]\s*(\d{6})\s*[\)）]",
+        r"([A-Za-z0-9\u4e00-\u9fff\-]+)\s*[\(（]\s*(\d{6})\s*[\)）]",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, section):
+            name = re.sub(r"^[\s\d.)、*-]+|[\s*:：*-]+$", "", match.group(1)).strip()
+            code = match.group(2)
+            if code in seen:
+                continue
+            seen.add(code)
+            items.append({"code": code, "name": name})
+    return items
+
+
+def extract_focus_items_from_context(focus_codes, compact_items):
+    names = {
+        compact_stock_code(item.get("code")): item.get("name")
+        for item in compact_items
+        if item.get("code")
+    }
+    normalized = []
+    seen = set()
+    for item in focus_codes:
+        code = compact_stock_code(item.get("code"))
+        if not code:
+            continue
         if code in seen:
             continue
         seen.add(code)
-        items.append({"code": code, "name": name})
-    return items
+        normalized.append({"code": code, "name": item.get("name") or names.get(code)})
+    return normalized
 
 
 def previous_focus_review(report_date):
     previous = latest_watch_report_before(report_date)
     if not previous:
         return None
-    focus_items = extract_focus_codes_from_report_text(previous.get("ai_summary") or "")
+    focus_items = extract_focus_items_from_market_data(previous.get("market_data"))
+    if not focus_items:
+        focus_items = extract_focus_codes_from_report_text(previous.get("ai_summary") or "")
     if not focus_items:
         return {
             "previous_report_date": previous["report_date"],
@@ -1057,11 +1121,16 @@ def generate_watch_report(report_date=None):
         f"K线摘要：{json.dumps(compact_context, ensure_ascii=False)}"
     )
     result = ai_complete([prompt])
+    focus_items = extract_focus_items_from_context(
+        extract_focus_codes_from_report_text(result["text"]),
+        compact_items,
+    )
     report_id = str(uuid.uuid4())
     market_data = {
         "type": "watch_report",
         "coverage": coverage,
         "previous_focus_review": focus_review,
+        "focus_items": focus_items,
         "watch_items": compact_items,
         "market_context": compact_context,
     }
@@ -2839,6 +2908,12 @@ def daily_report_loop():
         stamp = current.strftime("%Y-%m-%d %H:%M")
         if current.strftime("%H:%M") == DAILY_REPORT_TIME and last_sent != stamp:
             try:
+                report_date = current.date().isoformat()
+                if not is_china_market_trading_day(report_date):
+                    print(f"Daily report skipped: {report_date} is not a China market trading day")
+                    last_sent = stamp
+                    time.sleep(30)
+                    continue
                 report = generate_watch_report()
                 result = telegram_broadcast_report(report)
                 if result["failed"]:

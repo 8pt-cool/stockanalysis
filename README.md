@@ -92,7 +92,8 @@ works.
   - `/sector`
   - photo upload
 - Optional daily Telegram watchlist report with `TELEGRAM_REPORT_CHAT_ID` and
-  `DAILY_REPORT_TIME`
+  `DAILY_REPORT_TIME`; automatic reports are skipped on non-China-market
+  trading days
 
 ## Screenshot Modes
 
