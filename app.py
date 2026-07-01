@@ -959,7 +959,7 @@ def watch_market_contexts(watch_items, report_date):
         return list(pool.map(load, items))
 
 
-def latest_watch_report_before(report_date):
+def watch_reports_before(report_date, limit=60):
     with db() as conn:
         rows = conn.execute(
             """
@@ -967,23 +967,42 @@ def latest_watch_report_before(report_date):
             FROM daily_stock_reports
             WHERE report_date < ?
             ORDER BY report_date DESC, created_at DESC
-            LIMIT 20
+            LIMIT ?
             """,
-            (report_date,),
+            (report_date, limit),
         ).fetchall()
+    reports = []
     for row in rows:
         try:
             market_data = json.loads(row["market_data_json"] or "{}")
         except Exception:
             market_data = {}
         if market_data.get("type") == "watch_report":
-            return {
-                "report_date": row["report_date"],
-                "created_at": row["created_at"],
-                "market_data": market_data,
-                "ai_summary": row["ai_summary"] or "",
-            }
-    return None
+            reports.append(
+                {
+                    "report_date": row["report_date"],
+                    "created_at": row["created_at"],
+                    "market_data": market_data,
+                    "ai_summary": row["ai_summary"] or "",
+                }
+            )
+    return reports
+
+
+def latest_watch_report_before(report_date):
+    reports = watch_reports_before(report_date, limit=60)
+    return reports[0] if reports else None
+
+
+def watch_report_uses_own_market_date(report):
+    market_data = (report or {}).get("market_data") or {}
+    coverage = market_data.get("coverage") or {}
+    report_date = (report or {}).get("report_date")
+    data_dates = coverage.get("data_dates") or []
+    stale = coverage.get("stale")
+    if report_date and data_dates:
+        return report_date in data_dates and stale in (0, None)
+    return True
 
 
 def extract_focus_items_from_market_data(market_data):
@@ -1035,8 +1054,8 @@ def extract_focus_codes_from_report_text(text):
 
 
 def extract_focus_items_from_context(focus_codes, compact_items):
-    names = {
-        compact_stock_code(item.get("code")): item.get("name")
+    metadata = {
+        compact_stock_code(item.get("code")): item
         for item in compact_items
         if item.get("code")
     }
@@ -1049,17 +1068,39 @@ def extract_focus_items_from_context(focus_codes, compact_items):
         if code in seen:
             continue
         seen.add(code)
-        normalized.append({"code": code, "name": item.get("name") or names.get(code)})
+        meta = metadata.get(code) or {}
+        normalized.append(
+            {
+                "code": code,
+                "name": item.get("name") or meta.get("name"),
+                "sector": item.get("sector") or meta.get("sector"),
+                "rank": item.get("rank") or meta.get("rank"),
+            }
+        )
     return normalized
 
 
 def previous_focus_review(report_date):
-    previous = latest_watch_report_before(report_date)
+    previous = None
+    focus_items = []
+    for candidate in watch_reports_before(report_date, limit=60):
+        if not watch_report_uses_own_market_date(candidate):
+            continue
+        market_data = candidate.get("market_data") or {}
+        compact_items = market_data.get("watch_items") or []
+        focus_items = extract_focus_items_from_market_data(market_data)
+        if not focus_items:
+            focus_items = extract_focus_items_from_context(
+                extract_focus_codes_from_report_text(candidate.get("ai_summary") or ""),
+                compact_items,
+            )
+        if focus_items:
+            previous = candidate
+            break
+        if previous is None:
+            previous = candidate
     if not previous:
         return None
-    focus_items = extract_focus_items_from_market_data(previous.get("market_data"))
-    if not focus_items:
-        focus_items = extract_focus_codes_from_report_text(previous.get("ai_summary") or "")
     if not focus_items:
         return {
             "previous_report_date": previous["report_date"],
@@ -1069,13 +1110,43 @@ def previous_focus_review(report_date):
     today_context = []
     for item in focus_items[:12]:
         context = compact_market_context(market_context_for_stock(item["code"], report_date))
-        context.update({"name": item.get("name")})
+        context.update(
+            {
+                "name": item.get("name"),
+                "sector": item.get("sector"),
+                "rank": item.get("rank"),
+            }
+        )
         today_context.append(context)
     return {
         "previous_report_date": previous["report_date"],
+        "previous_created_at": previous.get("created_at"),
         "focus_items": focus_items[:12],
         "today_context": today_context,
     }
+
+
+def enrich_watch_market_contexts(watch_items, market_context):
+    metadata = {
+        compact_stock_code(item.get("stock_code")): item
+        for item in watch_items
+        if item.get("stock_code")
+    }
+    enriched = []
+    for context in market_context:
+        compact = compact_market_context(context)
+        code = compact_stock_code(compact.get("code") or compact.get("stock_code"))
+        item = metadata.get(code) or {}
+        compact.update(
+            {
+                "name": item.get("stock_name"),
+                "sector": item.get("sector_name") or "未分组",
+                "rank": item.get("sector_rank"),
+                "strategy": item.get("strategy_type"),
+            }
+        )
+        enriched.append(compact)
+    return enriched
 
 
 def generate_watch_report(report_date=None):
@@ -1084,7 +1155,7 @@ def generate_watch_report(report_date=None):
     market_context = watch_market_contexts(watch_items, report_date)
     focus_review = previous_focus_review(report_date)
     compact_items = [compact_watch_item(item) for item in watch_items]
-    compact_context = [compact_market_context(item) for item in market_context]
+    compact_context = enrich_watch_market_contexts(watch_items, market_context)
     ok_context = [item for item in compact_context if item.get("ok")]
     missing_context = [item for item in compact_context if not item.get("ok")]
     stale_context = [
@@ -1111,6 +1182,7 @@ def generate_watch_report(report_date=None):
         "如果提供了昨日重点关注回顾，请先输出“昨日重点关注回顾”小节，简明说明昨天重点票今天哪些兑现、哪些转弱、哪些继续观察。\n"
         "如果缺失行情，只列出缺失股票；如果未缺失，请明确说明“未详细展开的股票不代表数据缺失”。\n"
         "不要逐股平铺全部自选股，先筛选最值得明日观察的 8-12 只，再按三类输出：重点观察、继续跟踪、暂时回避。\n"
+        "每只入选股票标题必须使用“名称（代码｜概念）”格式；概念优先使用 K线摘要或自选股里的 sector 字段，缺失时写“未分组”。\n"
         "每个入选股票说明具体依据：涨跌幅、MA5/MA10/MA20、量能相对 20 日均量、是否有企稳/过热/破位迹象。\n"
         "请直接使用提供的精确数值，不要写“估算”“约”“大约”。\n"
         "总字数控制在 1400 字以内。\n"

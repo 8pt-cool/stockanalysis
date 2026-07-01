@@ -18,8 +18,14 @@ mkdir -p "$LAUNCH_AGENTS_DIR"
 rsync -a --delete \
   --exclude '.git' \
   --exclude '.DS_Store' \
+  --exclude '.env' \
+  --exclude 'data' \
   "$PROJECT_DIR/" \
   "$APP_SUPPORT_DIR/"
+
+if [[ ! -f "$APP_SUPPORT_DIR/.env" && -f "$PROJECT_DIR/.env" ]]; then
+  cp "$PROJECT_DIR/.env" "$APP_SUPPORT_DIR/.env"
+fi
 
 cp "$PROJECT_DIR/scripts/$PLIST_NAME" "$PLIST_PATH"
 

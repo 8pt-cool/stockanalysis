@@ -200,6 +200,9 @@ After code changes, redeploy and restart with:
 ./scripts/deploy_launchd.sh
 ```
 
+The deploy script updates code and service files while preserving the runtime
+`.env`, SQLite database, uploads, and logs under `~/Library/Application Support/StockAnalysis`.
+
 Useful checks:
 
 ```sh
