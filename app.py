@@ -989,6 +989,28 @@ def watch_reports_before(report_date, limit=60):
     return reports
 
 
+def watch_report_exists(report_date):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT market_data_json
+            FROM daily_stock_reports
+            WHERE report_date = ?
+            ORDER BY created_at DESC
+            LIMIT 20
+            """,
+            (report_date,),
+        ).fetchall()
+    for row in rows:
+        try:
+            market_data = json.loads(row["market_data_json"] or "{}")
+        except Exception:
+            market_data = {}
+        if market_data.get("type") == "watch_report":
+            return True
+    return False
+
+
 def latest_watch_report_before(report_date):
     reports = watch_reports_before(report_date, limit=60)
     return reports[0] if reports else None
@@ -2973,35 +2995,50 @@ def handle_telegram_message(message):
 
 def daily_report_loop():
     if not TELEGRAM_BOT_TOKEN or not DAILY_REPORT_TIME:
+        print("Daily report disabled: TELEGRAM_BOT_TOKEN or DAILY_REPORT_TIME is empty", flush=True)
         return
-    last_sent = ""
+    last_sent_date = ""
+    try:
+        scheduled_hour, scheduled_minute = [int(part) for part in DAILY_REPORT_TIME.split(":", 1)]
+        scheduled_time = dt.time(scheduled_hour, scheduled_minute)
+    except Exception:
+        print(f"Daily report disabled: invalid DAILY_REPORT_TIME={DAILY_REPORT_TIME}", flush=True)
+        return
+    current = dt.datetime.now()
+    if current.time() >= scheduled_time and watch_report_exists(current.date().isoformat()):
+        last_sent_date = current.date().isoformat()
+    print(f"Daily report scheduler started: {DAILY_REPORT_TIME}", flush=True)
     while True:
         current = dt.datetime.now()
-        stamp = current.strftime("%Y-%m-%d %H:%M")
-        if current.strftime("%H:%M") == DAILY_REPORT_TIME and last_sent != stamp:
+        report_date = current.date().isoformat()
+        if current.time() >= scheduled_time and last_sent_date != report_date:
             try:
-                report_date = current.date().isoformat()
+                print(f"Daily report due: {report_date} {current.strftime('%H:%M:%S')}", flush=True)
                 if not is_china_market_trading_day(report_date):
-                    print(f"Daily report skipped: {report_date} is not a China market trading day")
-                    last_sent = stamp
+                    print(f"Daily report skipped: {report_date} is not a China market trading day", flush=True)
+                    last_sent_date = report_date
                     time.sleep(30)
                     continue
                 report = generate_watch_report()
                 result = telegram_broadcast_report(report)
+                print(
+                    f"Daily report sent: {report_date} sent={len(result.get('sent', []))} failed={len(result.get('failed', []))}",
+                    flush=True,
+                )
                 if result["failed"]:
-                    print(f"Daily report partial failure: {result['failed']}")
-                last_sent = stamp
+                    print(f"Daily report partial failure: {result['failed']}", flush=True)
+                last_sent_date = report_date
             except Exception as exc:
-                print(f"Daily report error: {exc}")
+                print(f"Daily report error: {exc}", flush=True)
         time.sleep(30)
 
 
 def telegram_loop():
     if not TELEGRAM_BOT_TOKEN:
-        print("Telegram disabled: TELEGRAM_BOT_TOKEN is empty")
+        print("Telegram disabled: TELEGRAM_BOT_TOKEN is empty", flush=True)
         return
     offset = None
-    print("Telegram polling started")
+    print("Telegram polling started", flush=True)
     while True:
         try:
             payload = {"timeout": 60}
@@ -3014,7 +3051,7 @@ def telegram_loop():
                 if message:
                     handle_telegram_message(message)
         except Exception as exc:
-            print(f"Telegram polling error: {exc}")
+            print(f"Telegram polling error: {exc}", flush=True)
             time.sleep(5)
 
 
@@ -3023,8 +3060,8 @@ def main():
     threading.Thread(target=telegram_loop, daemon=True).start()
     threading.Thread(target=daily_report_loop, daemon=True).start()
     server = ThreadingHTTPServer((APP_HOST, APP_PORT), AppHandler)
-    print(f"Trade Review Assistant running at http://{APP_HOST}:{APP_PORT}")
-    print(f"Use APP_SECRET as the web password. Current value: {APP_SECRET}")
+    print(f"Trade Review Assistant running at http://{APP_HOST}:{APP_PORT}", flush=True)
+    print("Use APP_SECRET as the web password.", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

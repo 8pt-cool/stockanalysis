@@ -8,6 +8,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
+    <string>-u</string>
     <string>/Users/charleszhang/Library/Application Support/StockAnalysis/app.py</string>
   </array>
 
