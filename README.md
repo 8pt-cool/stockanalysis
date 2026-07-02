@@ -6,6 +6,8 @@ Telegram bot integration, and AI hooks for screenshot extraction and review.
 This app is intentionally a review and discipline tool. It does not place trades
 and does not connect to broker or Tonghuashun accounts.
 
+For cross-computer or new-thread handoff notes, read `PROJECT_CONTEXT.md`.
+
 ## Quick Start
 
 ```sh
