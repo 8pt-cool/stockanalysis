@@ -7,6 +7,7 @@ This app is intentionally a review and discipline tool. It does not place trades
 and does not connect to broker or Tonghuashun accounts.
 
 For cross-computer or new-thread handoff notes, read `PROJECT_CONTEXT.md`.
+For cloud VPS deployment, read `DEPLOY_DOCKER.md`.
 
 ## Quick Start
 

@@ -1,0 +1,23 @@
+services:
+  stockanalysis:
+    build: .
+    container_name: stockanalysis
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8765
+      DATABASE_PATH: /app/data/trade_review.sqlite3
+      LOCAL_OCR_ENABLED: "false"
+      TZ: Asia/Hong_Kong
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

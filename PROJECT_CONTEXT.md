@@ -122,6 +122,7 @@ time. Telegram long polling can conflict and cause missed or duplicated updates.
 - Web assets: `public/`
 - macOS launchd template: `scripts/com.charleszhang.stockanalysis.plist`
 - Mac redeploy script: `scripts/deploy_launchd.sh`
+- Docker cloud deployment guide: `DEPLOY_DOCKER.md`
 - OCR helper: `scripts/vision_ocr.swift`
 
 Market data:
@@ -204,6 +205,25 @@ git push origin main
 
 Use a GitHub PAT with write access when prompted. Do not put PATs in remotes,
 scripts, `.env`, README, or this context file.
+
+## Cloud VPS Handoff
+
+The Docker deployment files are:
+
+```text
+Dockerfile
+docker-compose.yml
+.env.docker.example
+DEPLOY_DOCKER.md
+```
+
+Use a non-mainland-China region for Telegram reliability.
+On cloud VPS, set `APP_HOST=0.0.0.0`, mount `./data:/app/data`, and keep
+runtime secrets in `.env`.
+
+The Docker version disables macOS local OCR by default. LM Studio/local vision is
+not expected to work on a small VPS; use a cloud vision provider later if
+screenshot recognition is required.
 
 ## Recent Decisions And Fixes
 
