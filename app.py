@@ -1774,7 +1774,9 @@ def screenshot_prompt(image_type):
             common
             + "这类图片是券商/App 的持仓列表截图，通常每行包含股票名称、代码、持仓数量、成本价、现价、市值、盈亏或盈亏比例。\n"
             "请只提取真实持仓股票，不要提取指数、自选栏目、按钮、账户汇总行。股票代码通常是 6 位数字；看不清的字段填 null。\n"
-            "quantity 必须是持仓数量/股票数量，不要用可买数量、成交金额或市值代替。cost_price 是成本价，last_price 是现价。\n"
+            "如果表头是“市值、持有盈亏、当日盈亏、成本/现价”，每行左侧第一行是股票名称、第二行是市值；"
+            "最右侧“成本/现价”单元格第一行是 cost_price，第二行是 last_price，必须分别提取。\n"
+            "quantity 必须是持仓数量/股票数量，不要用可买数量、成交金额或市值代替；如果图片没有直接显示数量，填 null，后续系统会用市值/现价估算。\n"
             "返回结构：{\"type\":\"position_snapshot\",\"positions\":[{\"stock_code\":null,\"stock_name\":null,"
             "\"quantity\":null,\"cost_price\":null,\"last_price\":null,\"market_value\":null,\"pnl\":null,"
             "\"pnl_pct\":null,\"position_type\":null,\"confidence\":0到1,\"raw_text\":null}],\"warnings\":[]}"
@@ -2861,8 +2863,15 @@ def import_positions_from_screenshot(payload):
         stock_code = compact_stock_code(item.get("stock_code"))
         stock_name = str(item.get("stock_name") or "").strip()
         last_price = as_number(item.get("last_price"))
+        market_value = as_number(item.get("market_value"))
         cost_price = as_number(item.get("cost_price"))
         quantity = as_int(item.get("quantity"))
+        quantity_estimated = False
+        if (quantity is None or quantity <= 0) and market_value is not None and last_price:
+            estimated_quantity = round(market_value / last_price)
+            if estimated_quantity > 0:
+                quantity = estimated_quantity
+                quantity_estimated = True
         if quantity is None or quantity <= 0:
             skipped.append({"index": index, "reason": "quantity must be positive", "item": item})
             continue
@@ -2872,9 +2881,11 @@ def import_positions_from_screenshot(payload):
             skipped.append({"index": index, "reason": "stock_code is required", "item": item})
             continue
         note_parts = ["持仓截图导入"]
+        if quantity_estimated:
+            note_parts.append("数量按市值/现价估算")
         for label, value in (
             ("现价", last_price),
-            ("市值", as_number(item.get("market_value"))),
+            ("市值", market_value),
             ("盈亏", as_number(item.get("pnl"))),
             ("盈亏率", as_number(item.get("pnl_pct"))),
         ):
