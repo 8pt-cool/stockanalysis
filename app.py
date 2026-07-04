@@ -1542,11 +1542,27 @@ def fetch_ak_board_spot(kind):
         import akshare as ak
     except ImportError as exc:
         raise RuntimeError(f"AKShare 未安装：{exc}")
-    if kind == "industry":
-        frame = ak.stock_board_industry_name_em()
-    else:
-        frame = ak.stock_board_concept_name_em()
-    return dataframe_records(frame)
+    try:
+        if kind == "industry":
+            frame = ak.stock_board_industry_name_em()
+        else:
+            frame = ak.stock_board_concept_name_em()
+        rows = dataframe_records(frame)
+        for row in rows:
+            row["_source"] = "eastmoney"
+        return rows
+    except Exception as eastmoney_exc:
+        try:
+            if kind == "industry":
+                frame = ak.stock_fund_flow_industry(symbol="即时")
+            else:
+                frame = ak.stock_fund_flow_concept(symbol="即时")
+            rows = dataframe_records(frame)
+            for row in rows:
+                row["_source"] = "fund_flow_ths"
+            return rows
+        except Exception as fallback_exc:
+            raise RuntimeError(f"Eastmoney 失败：{eastmoney_exc}; 同花顺资金流失败：{fallback_exc}")
 
 
 def fetch_ak_board_hist(kind, name, trade_date):
@@ -1556,22 +1572,36 @@ def fetch_ak_board_hist(kind, name, trade_date):
         raise RuntimeError(f"AKShare 未安装：{exc}")
     end = dt.date.fromisoformat(trade_date)
     start = end - dt.timedelta(days=70)
-    if kind == "industry":
-        frame = ak.stock_board_industry_hist_em(
-            symbol=name,
-            start_date=start.strftime("%Y%m%d"),
-            end_date=end.strftime("%Y%m%d"),
-            period="日k",
-            adjust="",
-        )
-    else:
-        frame = ak.stock_board_concept_hist_em(
-            symbol=name,
-            start_date=start.strftime("%Y%m%d"),
-            end_date=end.strftime("%Y%m%d"),
-            period="日k",
-            adjust="",
-        )
+    try:
+        if kind == "industry":
+            frame = ak.stock_board_industry_hist_em(
+                symbol=name,
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+                period="日k",
+                adjust="",
+            )
+        else:
+            frame = ak.stock_board_concept_hist_em(
+                symbol=name,
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+                period="日k",
+                adjust="",
+            )
+    except Exception:
+        if kind == "industry":
+            frame = ak.stock_board_industry_index_ths(
+                symbol=name,
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+            )
+        else:
+            frame = ak.stock_board_concept_index_ths(
+                symbol=name,
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+            )
     rows = dataframe_records(frame)
     return [row for row in rows if str(row.get("日期", "")) <= trade_date]
 
@@ -1596,7 +1626,7 @@ def summarize_board_members(members):
         pct = as_number(first_present(row, ("涨跌幅", "涨幅", "change_pct")))
         amount = as_number(first_present(row, ("成交额", "amount")))
         turnover = as_number(first_present(row, ("换手率", "turnover")))
-        price = as_number(first_present(row, ("最新价", "现价", "收盘")))
+        price = as_number(first_present(row, ("最新价", "现价", "收盘", "当前价")))
         if not name and not code:
             continue
         score = (pct or 0) * 2
@@ -1636,12 +1666,16 @@ def summarize_board_hist(rows):
         return {"ok": False, "error": "no board hist"}
     latest = rows[-1]
     recent = rows[-20:]
-    amount_values = [as_number(row.get("成交额")) for row in recent[:-1]]
-    volume_values = [as_number(row.get("成交量")) for row in recent[:-1]]
-    close_values = [as_number(row.get("收盘")) for row in recent]
-    amount = as_number(latest.get("成交额"))
-    volume = as_number(latest.get("成交量"))
-    close = as_number(latest.get("收盘"))
+    amount_values = [as_number(first_present(row, ("成交额", "总成交额"))) for row in recent[:-1]]
+    volume_values = [as_number(first_present(row, ("成交量", "总成交量"))) for row in recent[:-1]]
+    close_values = [as_number(first_present(row, ("收盘", "收盘价"))) for row in recent]
+    amount = as_number(first_present(latest, ("成交额", "总成交额")))
+    volume = as_number(first_present(latest, ("成交量", "总成交量")))
+    close = as_number(first_present(latest, ("收盘", "收盘价")))
+    previous_close = close_values[-2] if len(close_values) >= 2 else None
+    pct = as_number(latest.get("涨跌幅"))
+    if pct is None and close is not None and previous_close:
+        pct = round((close - previous_close) / previous_close * 100, 4)
     ma5 = mean(close_values[-5:])
     ma10 = mean(close_values[-10:])
     ma20 = mean(close_values[-20:])
@@ -1652,7 +1686,7 @@ def summarize_board_hist(rows):
         "ok": True,
         "date": latest.get("日期"),
         "close": close,
-        "pct": as_number(latest.get("涨跌幅")),
+        "pct": pct,
         "amount": amount,
         "volume": volume,
         "amount_vs_5d": round(amount / amount_ma5, 4) if amount and amount_ma5 else None,
@@ -1693,8 +1727,8 @@ def hot_sector_snapshot(trade_date=None, max_boards=16):
             errors.append(f"{label}板块列表失败：{exc}")
             continue
         for row in rows:
-            name = clean_board_name(first_present(row, ("板块名称", "名称", "name")))
-            pct = as_number(first_present(row, ("涨跌幅", "涨幅")))
+            name = clean_board_name(first_present(row, ("板块名称", "板块", "行业", "名称", "name")))
+            pct = as_number(first_present(row, ("涨跌幅", "涨幅", "行业-涨跌幅")))
             if not name or pct is None:
                 continue
             raw_boards.append(
@@ -1702,14 +1736,14 @@ def hot_sector_snapshot(trade_date=None, max_boards=16):
                     "kind": kind,
                     "kind_name": label,
                     "name": name,
+                    "source": row.get("_source") or "unknown",
                     "pct_spot": pct,
-                    "amount_spot": as_number(first_present(row, ("成交额", "总成交额"))),
+                    "amount_spot": as_number(first_present(row, ("成交额", "总成交额", "流入资金"))),
                     "up_count_spot": as_int(first_present(row, ("上涨家数", "上涨数"))),
                     "down_count_spot": as_int(first_present(row, ("下跌家数", "下跌数"))),
                     "leading_stock_spot": first_present(row, ("领涨股票", "领涨股")),
-                    "leading_stock_pct_spot": as_number(
-                        first_present(row, ("领涨股票-涨跌幅", "领涨股涨跌幅"))
-                    ),
+                    "leading_stock_price_spot": as_number(first_present(row, ("领涨股票-最新价", "领涨股-最新价", "当前价"))),
+                    "leading_stock_pct_spot": as_number(first_present(row, ("领涨股票-涨跌幅", "领涨股-涨跌幅", "领涨股涨跌幅"))),
                 }
             )
     candidate_map = {}
@@ -1726,11 +1760,39 @@ def hot_sector_snapshot(trade_date=None, max_boards=16):
         except Exception as exc:
             board["hist_error"] = str(exc)
             board["pct"] = row.get("pct_spot")
-        try:
-            board.update(summarize_board_members(fetch_ak_board_members(row["kind"], row["name"])))
-        except Exception as exc:
-            board["member_error"] = str(exc)
-            board["leaders"] = []
+        if row.get("source") == "fund_flow_ths":
+            leader_name = row.get("leading_stock_spot")
+            board["leaders"] = (
+                [
+                    {
+                        "name": leader_name,
+                        "pct": row.get("leading_stock_pct_spot"),
+                        "price": row.get("leading_stock_price_spot"),
+                        "source": "fund_flow_leading_stock",
+                    }
+                ]
+                if leader_name
+                else []
+            )
+            board.setdefault("member_count", None)
+        else:
+            try:
+                board.update(summarize_board_members(fetch_ak_board_members(row["kind"], row["name"])))
+            except Exception as exc:
+                board["member_error"] = str(exc)
+                leader_name = row.get("leading_stock_spot")
+                board["leaders"] = (
+                    [
+                        {
+                            "name": leader_name,
+                            "pct": row.get("leading_stock_pct_spot"),
+                            "price": row.get("leading_stock_price_spot"),
+                            "source": "spot_leading_stock",
+                        }
+                    ]
+                    if leader_name
+                    else []
+                )
         if board.get("up_ratio") is None:
             up = board.get("up_count_spot") or 0
             down = board.get("down_count_spot") or 0
