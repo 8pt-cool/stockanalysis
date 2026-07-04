@@ -68,6 +68,7 @@
             <option value="intraday_sb">日内 S/B 点</option>
             <option value="broker_records">券商成交记录合集</option>
             <option value="watchlist_snapshot">自选股列表截图</option>
+            <option value="position_snapshot">持仓列表截图</option>
           </select>
         </label>
         <input id="screenshotInput" type="file" accept="image/*" />
@@ -110,6 +111,7 @@
           <label>报告日期<input id="reportDate" type="date" /></label>
           <button id="reviewBtn" class="primary">生成今日交易复盘</button>
           <button id="watchReportBtn">生成自选股日报</button>
+          <button id="hotSectorBtn">生成热点板块分析</button>
         </div>
         <pre id="aiOutput" class="output"></pre>
       </section>

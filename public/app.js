@@ -314,6 +314,16 @@ function initForms() {
     setOutput("#aiOutput", data.report);
   });
 
+  $("#hotSectorBtn").addEventListener("click", async () => {
+    setOutput("#aiOutput", "生成中...");
+    const reportDate = $("#reportDate").value || today();
+    const data = await api("/api/hot-sector-report", {
+      method: "POST",
+      body: JSON.stringify({ report_date: reportDate }),
+    });
+    setOutput("#aiOutput", data.report);
+  });
+
   $("#uploadBtn").addEventListener("click", async () => {
     const file = $("#screenshotInput").files[0];
     if (!file) {

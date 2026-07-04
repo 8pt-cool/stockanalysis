@@ -1508,6 +1508,290 @@ def generate_position_report(report_date=None):
     return result["text"]
 
 
+def previous_trading_date(value=None, max_lookback=12):
+    current = dt.date.fromisoformat(value or today_str())
+    for offset in range(max_lookback + 1):
+        candidate = (current - dt.timedelta(days=offset)).isoformat()
+        if is_china_market_trading_day(candidate):
+            return candidate
+    return value or today_str()
+
+
+def first_present(row, names):
+    for name in names:
+        if name in row:
+            value = row.get(name)
+            if value is not None and str(value) != "nan":
+                return value
+    return None
+
+
+def clean_board_name(value):
+    text = str(value or "").strip()
+    return text.replace("板块", "").strip() or text
+
+
+def dataframe_records(frame):
+    if frame is None or frame.empty:
+        return []
+    return frame_records(frame)
+
+
+def fetch_ak_board_spot(kind):
+    try:
+        import akshare as ak
+    except ImportError as exc:
+        raise RuntimeError(f"AKShare 未安装：{exc}")
+    if kind == "industry":
+        frame = ak.stock_board_industry_name_em()
+    else:
+        frame = ak.stock_board_concept_name_em()
+    return dataframe_records(frame)
+
+
+def fetch_ak_board_hist(kind, name, trade_date):
+    try:
+        import akshare as ak
+    except ImportError as exc:
+        raise RuntimeError(f"AKShare 未安装：{exc}")
+    end = dt.date.fromisoformat(trade_date)
+    start = end - dt.timedelta(days=70)
+    if kind == "industry":
+        frame = ak.stock_board_industry_hist_em(
+            symbol=name,
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            period="日k",
+            adjust="",
+        )
+    else:
+        frame = ak.stock_board_concept_hist_em(
+            symbol=name,
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            period="日k",
+            adjust="",
+        )
+    rows = dataframe_records(frame)
+    return [row for row in rows if str(row.get("日期", "")) <= trade_date]
+
+
+def fetch_ak_board_members(kind, name):
+    try:
+        import akshare as ak
+    except ImportError as exc:
+        raise RuntimeError(f"AKShare 未安装：{exc}")
+    if kind == "industry":
+        frame = ak.stock_board_industry_cons_em(symbol=name)
+    else:
+        frame = ak.stock_board_concept_cons_em(symbol=name)
+    return dataframe_records(frame)
+
+
+def summarize_board_members(members):
+    normalized = []
+    for row in members:
+        code = compact_stock_code(first_present(row, ("代码", "股票代码", "code")))
+        name = str(first_present(row, ("名称", "股票名称", "name")) or "").strip()
+        pct = as_number(first_present(row, ("涨跌幅", "涨幅", "change_pct")))
+        amount = as_number(first_present(row, ("成交额", "amount")))
+        turnover = as_number(first_present(row, ("换手率", "turnover")))
+        price = as_number(first_present(row, ("最新价", "现价", "收盘")))
+        if not name and not code:
+            continue
+        score = (pct or 0) * 2
+        if amount:
+            score += min(amount / 100000000, 10)
+        if turnover:
+            score += min(turnover, 20) * 0.25
+        normalized.append(
+            {
+                "code": code or None,
+                "name": name or None,
+                "pct": pct,
+                "amount": amount,
+                "turnover": turnover,
+                "price": price,
+                "score": round(score, 4),
+            }
+        )
+    up_count = sum(1 for item in normalized if (item.get("pct") or 0) > 0)
+    down_count = sum(1 for item in normalized if (item.get("pct") or 0) < 0)
+    leaders = sorted(
+        normalized,
+        key=lambda item: (item.get("score") or -999, item.get("amount") or 0),
+        reverse=True,
+    )[:5]
+    return {
+        "member_count": len(normalized),
+        "up_count": up_count,
+        "down_count": down_count,
+        "up_ratio": round(up_count / len(normalized), 4) if normalized else None,
+        "leaders": leaders,
+    }
+
+
+def summarize_board_hist(rows):
+    if not rows:
+        return {"ok": False, "error": "no board hist"}
+    latest = rows[-1]
+    recent = rows[-20:]
+    amount_values = [as_number(row.get("成交额")) for row in recent[:-1]]
+    volume_values = [as_number(row.get("成交量")) for row in recent[:-1]]
+    close_values = [as_number(row.get("收盘")) for row in recent]
+    amount = as_number(latest.get("成交额"))
+    volume = as_number(latest.get("成交量"))
+    close = as_number(latest.get("收盘"))
+    ma5 = mean(close_values[-5:])
+    ma10 = mean(close_values[-10:])
+    ma20 = mean(close_values[-20:])
+    amount_ma5 = mean(amount_values[-5:])
+    amount_ma20 = mean(amount_values[-20:])
+    volume_ma20 = mean(volume_values[-20:])
+    return {
+        "ok": True,
+        "date": latest.get("日期"),
+        "close": close,
+        "pct": as_number(latest.get("涨跌幅")),
+        "amount": amount,
+        "volume": volume,
+        "amount_vs_5d": round(amount / amount_ma5, 4) if amount and amount_ma5 else None,
+        "amount_vs_20d": round(amount / amount_ma20, 4) if amount and amount_ma20 else None,
+        "volume_vs_20d": round(volume / volume_ma20, 4) if volume and volume_ma20 else None,
+        "ma5": ma5,
+        "ma10": ma10,
+        "ma20": ma20,
+        "above_ma5": bool(close and ma5 and close >= ma5),
+        "above_ma10": bool(close and ma10 and close >= ma10),
+        "above_ma20": bool(close and ma20 and close >= ma20),
+    }
+
+
+def hot_sector_score(board):
+    pct = board.get("pct") or board.get("pct_spot") or 0
+    amount_ratio = board.get("amount_vs_20d") or board.get("amount_vs_5d") or 1
+    up_ratio = board.get("up_ratio") or 0
+    leader_pct = max([leader.get("pct") or 0 for leader in board.get("leaders") or []] or [0])
+    score = pct * 2.2 + min(amount_ratio, 3) * 2.0 + up_ratio * 4.0 + min(leader_pct, 12) * 0.35
+    if board.get("above_ma5"):
+        score += 1.2
+    if board.get("above_ma20"):
+        score += 1.0
+    if amount_ratio >= 1.5 and pct >= 1.5 and up_ratio >= 0.65:
+        score += 2.5
+    return round(score, 4)
+
+
+def hot_sector_snapshot(trade_date=None, max_boards=16):
+    trade_date = previous_trading_date(trade_date or today_str())
+    raw_boards = []
+    errors = []
+    for kind, label in (("industry", "行业"), ("concept", "概念")):
+        try:
+            rows = fetch_ak_board_spot(kind)
+        except Exception as exc:
+            errors.append(f"{label}板块列表失败：{exc}")
+            continue
+        for row in rows:
+            name = clean_board_name(first_present(row, ("板块名称", "名称", "name")))
+            pct = as_number(first_present(row, ("涨跌幅", "涨幅")))
+            if not name or pct is None:
+                continue
+            raw_boards.append(
+                {
+                    "kind": kind,
+                    "kind_name": label,
+                    "name": name,
+                    "pct_spot": pct,
+                    "amount_spot": as_number(first_present(row, ("成交额", "总成交额"))),
+                    "up_count_spot": as_int(first_present(row, ("上涨家数", "上涨数"))),
+                    "down_count_spot": as_int(first_present(row, ("下跌家数", "下跌数"))),
+                    "leading_stock_spot": first_present(row, ("领涨股票", "领涨股")),
+                    "leading_stock_pct_spot": as_number(
+                        first_present(row, ("领涨股票-涨跌幅", "领涨股涨跌幅"))
+                    ),
+                }
+            )
+    candidate_map = {}
+    for row in sorted(raw_boards, key=lambda item: item.get("pct_spot") or -999, reverse=True)[:24]:
+        candidate_map[(row["kind"], row["name"])] = row
+    for row in sorted(raw_boards, key=lambda item: item.get("amount_spot") or 0, reverse=True)[:16]:
+        candidate_map[(row["kind"], row["name"])] = row
+
+    boards = []
+    for row in list(candidate_map.values())[:max_boards]:
+        board = dict(row)
+        try:
+            board.update(summarize_board_hist(fetch_ak_board_hist(row["kind"], row["name"], trade_date)))
+        except Exception as exc:
+            board["hist_error"] = str(exc)
+            board["pct"] = row.get("pct_spot")
+        try:
+            board.update(summarize_board_members(fetch_ak_board_members(row["kind"], row["name"])))
+        except Exception as exc:
+            board["member_error"] = str(exc)
+            board["leaders"] = []
+        if board.get("up_ratio") is None:
+            up = board.get("up_count_spot") or 0
+            down = board.get("down_count_spot") or 0
+            board["up_ratio"] = round(up / (up + down), 4) if up + down else None
+        board["score"] = hot_sector_score(board)
+        board["volume_price_rising"] = bool(
+            (board.get("pct") or board.get("pct_spot") or 0) >= 1.5
+            and (board.get("amount_vs_20d") or board.get("amount_vs_5d") or 0) >= 1.3
+            and (board.get("up_ratio") or 0) >= 0.6
+        )
+        boards.append(board)
+    boards.sort(key=lambda item: item.get("score") or -999, reverse=True)
+    return {
+        "type": "hot_sector_snapshot",
+        "date": trade_date,
+        "source": "akshare_board_snapshot",
+        "errors": errors,
+        "boards": boards[:10],
+    }
+
+
+def generate_hot_sector_report(trade_date=None):
+    snapshot = hot_sector_snapshot(trade_date)
+    if not snapshot.get("boards"):
+        return (
+            f"A股热点板块分析 {snapshot.get('date')}\n\n"
+            "这次没有成功获取到板块行情数据，暂时不生成结论。\n"
+            "数据源错误："
+            + "；".join(str(item) for item in (snapshot.get("errors") or ["未知错误"])[:3])
+        )
+    prompt = (
+        "你是 A 股热点板块盘后分析助手。不要承诺收益，不要给确定买入建议。\n"
+        "用户重点关心：板块是否量价齐升、上涨是否有广度、龙头是谁、明天该观察什么触发条件。\n"
+        "请严格基于结构化快照，不要编造不存在的数据。若某项数据缺失，要说明缺失。\n"
+        "输出结构：\n"
+        "1. 今日量价齐升板块：列 3-5 个，说明涨幅、成交额相对均值、上涨占比、均线状态。\n"
+        "2. 龙头观察：每个重点板块点名 2-3 只龙头，解释是涨幅/成交额/换手/辨识度哪类强。\n"
+        "3. 分歧与风险：指出放量滞涨、上涨占比不足、过热追高风险。\n"
+        "4. 明日观察清单：用可执行条件描述，例如“板块放量不低于 20 日均额 1.3 倍且龙头不破 5 日线”。\n"
+        "总字数控制在 1600 字以内。\n"
+        f"快照：{json.dumps(snapshot, ensure_ascii=False)}"
+    )
+    result = ai_complete([prompt])
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO daily_stock_reports
+            (id, report_date, market_data_json, ai_summary, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                snapshot.get("date") or trade_date or today_str(),
+                json.dumps(snapshot, ensure_ascii=False),
+                result["text"],
+                now_iso(),
+            ),
+        )
+    return result["text"]
+
+
 def sector_watch_groups():
     groups = {}
     for item in list_watchlist():
@@ -3070,6 +3354,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     {"ok": True, "report": generate_sector_rotation_report(trade_date)},
                 )
                 return
+            if self.path == "/api/hot-sector-report":
+                trade_date = payload.get("date") or payload.get("report_date") or today_str()
+                json_response(self, {"ok": True, "report": generate_hot_sector_report(trade_date)})
+                return
             if self.path == "/api/import-screenshot-trades":
                 json_response(self, {"ok": True, **import_screenshot_trades(payload)})
                 return
@@ -3474,6 +3762,7 @@ def telegram_help_text():
         "/report 生成自选股日报\n"
         "/report yesterday 重算昨天自选股日报\n"
         "/sector 生成 AI 赛道轮动报告\n"
+        "/hot_sectors 生成当日 A 股热点板块分析\n"
         "/watch 代码 名称 加入自选\n"
         "/list 查看自选股\n"
         "/position 代码 名称 数量 成本价 维护私有持仓\n"
@@ -3570,6 +3859,10 @@ def handle_telegram_message(message):
     elif text.startswith("/sector"):
         telegram_send(chat_id, "开始生成 AI 赛道轮动报告，请稍等。")
         telegram_send(chat_id, generate_sector_rotation_report())
+    elif text.startswith("/hot_sectors"):
+        target = parse_telegram_date_arg(text, today_str())
+        telegram_send(chat_id, f"开始生成 {target} A 股热点板块分析，请稍等。")
+        telegram_send(chat_id, generate_hot_sector_report(target))
     elif message.get("photo"):
         photos = message["photo"]
         largest = max(photos, key=lambda item: item.get("file_size", 0))
