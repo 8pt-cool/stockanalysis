@@ -1837,7 +1837,7 @@ def generate_hot_sector_report(trade_date=None):
         "3. 分歧与风险：指出放量滞涨、上涨占比不足、过热追高风险。\n"
         "4. 明日观察清单：用可执行条件描述，例如“板块放量不低于 20 日均额 1.3 倍且龙头不破 5 日线”。\n"
         "总字数控制在 1600 字以内。\n"
-        f"快照：{json.dumps(snapshot, ensure_ascii=False)}"
+        f"快照：{json.dumps(snapshot, ensure_ascii=False, default=str)}"
     )
     result = ai_complete([prompt])
     with db() as conn:
@@ -1850,7 +1850,7 @@ def generate_hot_sector_report(trade_date=None):
             (
                 str(uuid.uuid4()),
                 snapshot.get("date") or trade_date or today_str(),
-                json.dumps(snapshot, ensure_ascii=False),
+                json.dumps(snapshot, ensure_ascii=False, default=str),
                 result["text"],
                 now_iso(),
             ),
