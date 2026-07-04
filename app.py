@@ -70,6 +70,7 @@ TELEGRAM_ALLOWED_USER_ID = os.getenv("TELEGRAM_ALLOWED_USER_ID", "")
 TELEGRAM_REPORT_CHAT_ID = os.getenv("TELEGRAM_REPORT_CHAT_ID", "")
 TELEGRAM_SUBSCRIBER_CHAT_IDS = os.getenv("TELEGRAM_SUBSCRIBER_CHAT_IDS", "")
 DAILY_REPORT_TIME = os.getenv("DAILY_REPORT_TIME", "15:30")
+POSITION_REPORT_TIME = os.getenv("POSITION_REPORT_TIME", "17:35")
 MARKET_DATA_PROVIDER = os.getenv("MARKET_DATA_PROVIDER", "akshare").strip().lower()
 MARKET_LOOKBACK_DAYS = int(os.getenv("MARKET_LOOKBACK_DAYS", "90"))
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
@@ -176,6 +177,30 @@ def init_db():
               ai_summary TEXT,
               signal_level TEXT,
               risk_level TEXT,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS positions (
+              id TEXT PRIMARY KEY,
+              stock_code TEXT NOT NULL UNIQUE,
+              stock_name TEXT,
+              quantity INTEGER NOT NULL DEFAULT 0,
+              cost_price REAL,
+              position_type TEXT,
+              max_position_pct REAL,
+              stop_loss_price REAL,
+              take_profit_plan TEXT,
+              notes TEXT,
+              active INTEGER NOT NULL DEFAULT 1,
+              updated_at TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS position_reports (
+              id TEXT PRIMARY KEY,
+              report_date TEXT NOT NULL,
+              market_data_json TEXT,
+              ai_summary TEXT,
               created_at TEXT NOT NULL
             );
 
@@ -558,6 +583,89 @@ def list_watchlist():
                 "SELECT * FROM watchlist WHERE active = 1 ORDER BY created_at DESC"
             )
         ]
+
+
+def upsert_position(payload):
+    now = now_iso()
+    item = {
+        "id": str(uuid.uuid4()),
+        "stock_code": compact_stock_code(payload.get("stock_code")),
+        "stock_name": str(payload.get("stock_name") or "").strip(),
+        "quantity": as_int(payload.get("quantity")) or 0,
+        "cost_price": as_number(payload.get("cost_price")),
+        "position_type": str(payload.get("position_type") or "").strip(),
+        "max_position_pct": as_number(payload.get("max_position_pct")),
+        "stop_loss_price": as_number(payload.get("stop_loss_price")),
+        "take_profit_plan": str(payload.get("take_profit_plan") or "").strip(),
+        "notes": str(payload.get("notes") or "").strip(),
+        "active": 1,
+        "updated_at": now,
+        "created_at": now,
+    }
+    if not item["stock_code"]:
+        raise ValueError("stock_code is required")
+    if item["quantity"] < 0:
+        raise ValueError("quantity must be non-negative")
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO positions
+            (id, stock_code, stock_name, quantity, cost_price, position_type,
+             max_position_pct, stop_loss_price, take_profit_plan, notes,
+             active, updated_at, created_at)
+            VALUES
+            (:id, :stock_code, :stock_name, :quantity, :cost_price, :position_type,
+             :max_position_pct, :stop_loss_price, :take_profit_plan, :notes,
+             :active, :updated_at, :created_at)
+            ON CONFLICT(stock_code) DO UPDATE SET
+              stock_name=COALESCE(NULLIF(excluded.stock_name, ''), positions.stock_name),
+              quantity=excluded.quantity,
+              cost_price=COALESCE(excluded.cost_price, positions.cost_price),
+              position_type=COALESCE(NULLIF(excluded.position_type, ''), positions.position_type),
+              max_position_pct=COALESCE(excluded.max_position_pct, positions.max_position_pct),
+              stop_loss_price=COALESCE(excluded.stop_loss_price, positions.stop_loss_price),
+              take_profit_plan=COALESCE(NULLIF(excluded.take_profit_plan, ''), positions.take_profit_plan),
+              notes=COALESCE(NULLIF(excluded.notes, ''), positions.notes),
+              active=1,
+              updated_at=excluded.updated_at
+            """,
+            item,
+        )
+    return item
+
+
+def list_positions(active_only=True):
+    query = "SELECT * FROM positions"
+    if active_only:
+        query += " WHERE active = 1 AND quantity > 0"
+    query += " ORDER BY updated_at DESC, created_at DESC"
+    with db() as conn:
+        return [row_to_dict(row) for row in conn.execute(query)]
+
+
+def deactivate_position(stock_code):
+    code = compact_stock_code(stock_code)
+    if not code:
+        raise ValueError("stock_code is required")
+    with db() as conn:
+        conn.execute(
+            "UPDATE positions SET active = 0, quantity = 0, updated_at = ? WHERE stock_code = ?",
+            (now_iso(), code),
+        )
+
+
+def compact_position(item):
+    return {
+        "code": item.get("stock_code"),
+        "name": item.get("stock_name"),
+        "quantity": item.get("quantity"),
+        "cost": item.get("cost_price"),
+        "type": item.get("position_type"),
+        "max_position_pct": item.get("max_position_pct"),
+        "stop_loss": item.get("stop_loss_price"),
+        "take_profit_plan": item.get("take_profit_plan"),
+        "notes": item.get("notes"),
+    }
 
 
 def compact_stock_code(stock_code):
@@ -1287,6 +1395,105 @@ def generate_watch_report(report_date=None):
         conn.execute(
             """
             INSERT INTO daily_stock_reports
+            (id, report_date, market_data_json, ai_summary, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                report_id,
+                report_date,
+                json.dumps(market_data, ensure_ascii=False),
+                result["text"],
+                now_iso(),
+            ),
+        )
+    return result["text"]
+
+
+def position_report_exists(report_date):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM position_reports WHERE report_date = ? LIMIT 1",
+            (report_date,),
+        ).fetchone()
+    return bool(row)
+
+
+def enrich_position_market_contexts(positions, report_date):
+    enriched = []
+    for position in positions:
+        context = compact_market_context(
+            market_context_for_stock(position.get("stock_code"), report_date)
+        )
+        cost = as_number(position.get("cost_price"))
+        close = as_number(context.get("close"))
+        quantity = as_int(position.get("quantity")) or 0
+        pnl_pct = (
+            round((close - cost) / cost * 100, 4)
+            if close is not None and cost not in (None, 0)
+            else None
+        )
+        market_value = round(close * quantity, 2) if close is not None else None
+        context.update(
+            {
+                "name": position.get("stock_name"),
+                "quantity": quantity,
+                "cost": cost,
+                "pnl_pct": pnl_pct,
+                "market_value": market_value,
+                "position_type": position.get("position_type"),
+                "max_position_pct": position.get("max_position_pct"),
+                "stop_loss": position.get("stop_loss_price"),
+                "take_profit_plan": position.get("take_profit_plan"),
+                "notes": position.get("notes"),
+            }
+        )
+        enriched.append(context)
+    return enriched
+
+
+def generate_position_report(report_date=None):
+    report_date = report_date or today_str()
+    positions = list_positions()
+    if not positions:
+        return "当前没有持仓记录。可用 /position 代码 名称 数量 成本价 添加。"
+    compact_positions = [compact_position(item) for item in positions]
+    market_context = enrich_position_market_contexts(positions, report_date)
+    ok_context = [item for item in market_context if item.get("ok")]
+    missing_context = [item for item in market_context if not item.get("ok")]
+    data_dates = sorted({item.get("date") for item in ok_context if item.get("date")})
+    coverage = {
+        "total": len(market_context),
+        "ok": len(ok_context),
+        "missing": len(missing_context),
+        "missing_items": missing_context,
+        "data_dates": data_dates,
+    }
+    prompt = (
+        "你是一个只服务用户本人的持仓风控复盘助手。不要承诺收益，不要给确定性荐股。\n"
+        "请基于用户持仓、成本和本地计算的 K 线摘要，输出私有持仓日报。\n"
+        "请第一行写“私有持仓日报”，第二行写行情覆盖和行情实际日期。\n"
+        "重点关注：仓位风险、成本线压力、是否跌破关键均线、是否放量下跌、是否过热、止损/止盈执行提醒。\n"
+        "请按三类输出：需要处理、继续持有观察、明日条件单/观察点。\n"
+        "每只股票必须写清：名称（代码）、当前价、成本价、浮盈亏比例、MA5/MA10/MA20、量能相对20日均量。\n"
+        "如果缺失行情，请明确列出，不要猜测。\n"
+        "总字数控制在 1400 字以内，语气克制、具体。\n"
+        f"日期：{report_date}\n"
+        f"行情覆盖：{json.dumps(coverage, ensure_ascii=False)}\n"
+        f"持仓：{json.dumps(compact_positions, ensure_ascii=False)}\n"
+        f"K线与盈亏摘要：{json.dumps(market_context, ensure_ascii=False)}"
+    )
+    result = ai_complete([prompt])
+    report_id = str(uuid.uuid4())
+    market_data = {
+        "type": "position_report",
+        "coverage": coverage,
+        "positions": compact_positions,
+        "market_context": market_context,
+    }
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO position_reports
             (id, report_date, market_data_json, ai_summary, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
@@ -2941,6 +3148,71 @@ def telegram_broadcast_report(text):
     return {"sent": sent, "failed": failed}
 
 
+def telegram_owner_recipient_ids():
+    recipients = []
+    if TELEGRAM_ALLOWED_USER_ID:
+        recipients.append(str(TELEGRAM_ALLOWED_USER_ID))
+    seen = set()
+    unique = []
+    for chat_id in recipients:
+        if chat_id and chat_id not in seen:
+            unique.append(chat_id)
+            seen.add(chat_id)
+    return unique
+
+
+def telegram_send_owner_only(text):
+    sent = []
+    failed = []
+    for chat_id in telegram_owner_recipient_ids():
+        try:
+            telegram_send(chat_id, text)
+            sent.append(chat_id)
+        except Exception as exc:
+            failed.append({"chat_id": chat_id, "error": str(exc)})
+    return {"sent": sent, "failed": failed}
+
+
+def format_positions_for_telegram():
+    positions = list_positions()
+    if not positions:
+        return "当前没有持仓记录。"
+    lines = ["当前私有持仓："]
+    for item in positions:
+        parts = [
+            item.get("stock_code") or "",
+            item.get("stock_name") or "",
+            f"数量 {item.get('quantity')}",
+        ]
+        if item.get("cost_price") is not None:
+            parts.append(f"成本 {item.get('cost_price')}")
+        if item.get("position_type"):
+            parts.append(str(item.get("position_type")))
+        if item.get("stop_loss_price") is not None:
+            parts.append(f"止损 {item.get('stop_loss_price')}")
+        lines.append(" ".join(str(part) for part in parts if part != ""))
+    return "\n".join(lines)
+
+
+def telegram_upsert_position_text(text):
+    parts = text.split(maxsplit=5)
+    if len(parts) < 5:
+        return "用法：/position 300308 中际旭创 200 128.5 核心持仓"
+    payload = {
+        "stock_code": parts[1],
+        "stock_name": parts[2],
+        "quantity": parts[3],
+        "cost_price": parts[4],
+        "position_type": parts[5] if len(parts) > 5 else "",
+    }
+    item = upsert_position(payload)
+    return (
+        "已更新私有持仓："
+        f"{item['stock_code']} {item['stock_name']} "
+        f"数量 {item['quantity']} 成本 {item.get('cost_price')}"
+    )
+
+
 def telegram_help_text():
     return (
         "可用指令：\n"
@@ -2956,6 +3228,10 @@ def telegram_help_text():
         "/sector 生成 AI 赛道轮动报告\n"
         "/watch 代码 名称 加入自选\n"
         "/list 查看自选股\n"
+        "/position 代码 名称 数量 成本价 维护私有持仓\n"
+        "/positions 查看私有持仓\n"
+        "/position_report 生成私有持仓日报\n"
+        "/position_remove 代码 删除私有持仓\n"
         "/reload 重新解析最近一张截图"
     )
 
@@ -3020,6 +3296,24 @@ def handle_telegram_message(message):
         payload = {"stock_code": parts[1], "stock_name": parts[2] if len(parts) > 2 else ""}
         upsert_watch(payload)
         telegram_send(chat_id, f"已加入自选：{payload['stock_code']} {payload['stock_name']}")
+    elif text.startswith("/positions"):
+        telegram_send(chat_id, format_positions_for_telegram())
+    elif text.startswith("/position_remove"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            telegram_send(chat_id, "用法：/position_remove 300308")
+            return
+        deactivate_position(parts[1])
+        telegram_send(chat_id, f"已删除私有持仓：{compact_stock_code(parts[1])}")
+    elif text.startswith("/position_report"):
+        target = parse_telegram_date_arg(text, today_str())
+        telegram_send(chat_id, f"开始生成 {target} 私有持仓日报，只会发送给你本人。")
+        telegram_send(chat_id, generate_position_report(target))
+    elif text.startswith("/position"):
+        try:
+            telegram_send(chat_id, telegram_upsert_position_text(text))
+        except Exception as exc:
+            telegram_send(chat_id, f"持仓更新失败：{exc}")
     elif text.startswith("/report"):
         target = parse_telegram_date_arg(text, today_str())
         telegram_send(chat_id, f"开始生成 {target} 自选股日报，请稍等。")
@@ -3088,6 +3382,54 @@ def daily_report_loop():
         time.sleep(30)
 
 
+def position_report_loop():
+    if not TELEGRAM_BOT_TOKEN or not POSITION_REPORT_TIME:
+        print("Position report disabled: TELEGRAM_BOT_TOKEN or POSITION_REPORT_TIME is empty", flush=True)
+        return
+    if not telegram_owner_recipient_ids():
+        print("Position report disabled: TELEGRAM_ALLOWED_USER_ID is empty", flush=True)
+        return
+    last_sent_date = ""
+    try:
+        scheduled_hour, scheduled_minute = [int(part) for part in POSITION_REPORT_TIME.split(":", 1)]
+        scheduled_time = dt.time(scheduled_hour, scheduled_minute)
+    except Exception:
+        print(f"Position report disabled: invalid POSITION_REPORT_TIME={POSITION_REPORT_TIME}", flush=True)
+        return
+    current = dt.datetime.now()
+    if current.time() >= scheduled_time and position_report_exists(current.date().isoformat()):
+        last_sent_date = current.date().isoformat()
+    print(f"Private position report scheduler started: {POSITION_REPORT_TIME}", flush=True)
+    while True:
+        current = dt.datetime.now()
+        report_date = current.date().isoformat()
+        if current.time() >= scheduled_time and last_sent_date != report_date:
+            try:
+                print(f"Position report due: {report_date} {current.strftime('%H:%M:%S')}", flush=True)
+                if not is_china_market_trading_day(report_date):
+                    print(f"Position report skipped: {report_date} is not a China market trading day", flush=True)
+                    last_sent_date = report_date
+                    time.sleep(30)
+                    continue
+                if not list_positions():
+                    print("Position report skipped: no active positions", flush=True)
+                    last_sent_date = report_date
+                    time.sleep(30)
+                    continue
+                report = generate_position_report(report_date)
+                result = telegram_send_owner_only(report)
+                print(
+                    f"Position report sent: {report_date} sent={len(result.get('sent', []))} failed={len(result.get('failed', []))}",
+                    flush=True,
+                )
+                if result["failed"]:
+                    print(f"Position report partial failure: {result['failed']}", flush=True)
+                last_sent_date = report_date
+            except Exception as exc:
+                print(f"Position report error: {exc}", flush=True)
+        time.sleep(30)
+
+
 def telegram_loop():
     if not TELEGRAM_BOT_TOKEN:
         print("Telegram disabled: TELEGRAM_BOT_TOKEN is empty", flush=True)
@@ -3114,6 +3456,7 @@ def main():
     init_db()
     threading.Thread(target=telegram_loop, daemon=True).start()
     threading.Thread(target=daily_report_loop, daemon=True).start()
+    threading.Thread(target=position_report_loop, daemon=True).start()
     server = ThreadingHTTPServer((APP_HOST, APP_PORT), AppHandler)
     print(f"Trade Review Assistant running at http://{APP_HOST}:{APP_PORT}", flush=True)
     print("Use APP_SECRET as the web password.", flush=True)
