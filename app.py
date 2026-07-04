@@ -1880,7 +1880,7 @@ def save_stock_code_cache(stock_name, stock_code, source):
         )
 
 
-def lookup_stock_code(stock_name, price=None):
+def lookup_stock_code(stock_name, price=None, allow_fund_lookup=True):
     name = str(stock_name or "").strip()
     if not name:
         return None
@@ -1902,23 +1902,24 @@ def lookup_stock_code(stock_name, price=None):
     except Exception:
         pass
 
-    try:
-        etfs = ak.fund_etf_spot_em()
-        candidates = etfs[etfs["名称"].astype(str).str.contains(name, regex=False)]
-        if not candidates.empty:
-            selected = candidates.iloc[0]
-            trade_price = as_number(price)
-            if trade_price is not None and "最新价" in candidates.columns:
-                candidates = candidates.copy()
-                candidates["_price_diff"] = candidates["最新价"].apply(
-                    lambda value: abs((as_number(value) or 0) - trade_price)
-                )
-                selected = candidates.sort_values("_price_diff").iloc[0]
-            code = str(selected["代码"])
-            save_stock_code_cache(name, code, "fund_etf_spot_em")
-            return code
-    except Exception:
-        pass
+    if allow_fund_lookup:
+        try:
+            etfs = ak.fund_etf_spot_em()
+            candidates = etfs[etfs["名称"].astype(str).str.contains(name, regex=False)]
+            if not candidates.empty:
+                selected = candidates.iloc[0]
+                trade_price = as_number(price)
+                if trade_price is not None and "最新价" in candidates.columns:
+                    candidates = candidates.copy()
+                    candidates["_price_diff"] = candidates["最新价"].apply(
+                        lambda value: abs((as_number(value) or 0) - trade_price)
+                    )
+                    selected = candidates.sort_values("_price_diff").iloc[0]
+                code = str(selected["代码"])
+                save_stock_code_cache(name, code, "fund_etf_spot_em")
+                return code
+        except Exception:
+            pass
     return None
 
 
@@ -2876,7 +2877,9 @@ def import_positions_from_screenshot(payload):
             skipped.append({"index": index, "reason": "quantity must be positive", "item": item})
             continue
         if not stock_code and stock_name:
-            stock_code = lookup_stock_code(stock_name, last_price or cost_price) or ""
+            stock_code = lookup_stock_code(
+                stock_name, last_price or cost_price, allow_fund_lookup=False
+            ) or ""
         if not stock_code:
             skipped.append({"index": index, "reason": "stock_code is required", "item": item})
             continue
