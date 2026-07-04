@@ -50,6 +50,10 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
+MINIMAX_BASE_URL = os.getenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1").rstrip("/")
+MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M3")
+MINIMAX_TIMEOUT_SECONDS = int(os.getenv("MINIMAX_TIMEOUT_SECONDS", "120"))
 LOCAL_AI_BASE_URL = os.getenv("LOCAL_AI_BASE_URL", "http://127.0.0.1:11434/v1").rstrip("/")
 LOCAL_AI_API_KEY = os.getenv("LOCAL_AI_API_KEY", "local")
 LOCAL_AI_MODEL = os.getenv("LOCAL_AI_MODEL", "google/gemma-4-31b")
@@ -246,9 +250,11 @@ def ai_complete(messages, image_b64=None, image_mime="image/jpeg"):
     if provider == "deepseek":
         if image_b64:
             return {
-                "text": "DeepSeek 当前配置用于文本分析；图片识别请使用 VISION_AI_PROVIDER=local。"
+                "text": "DeepSeek 当前配置用于文本分析；图片识别请使用 VISION_AI_PROVIDER=minimax 或 local。"
             }
         return deepseek_chat_completions(messages)
+    if provider == "minimax":
+        return minimax_chat_completions(messages, image_b64=image_b64, image_mime=image_mime)
     return openai_responses(messages, image_b64=image_b64, image_mime=image_mime)
 
 
@@ -293,6 +299,55 @@ def deepseek_chat_completions(messages):
         timeout=120,
         provider_name="DeepSeek",
     )
+
+
+def minimax_chat_completions(messages, image_b64=None, image_mime="image/jpeg"):
+    if not MINIMAX_API_KEY:
+        return {"text": "MiniMax 未配置：请在 .env 设置 MINIMAX_API_KEY。"}
+
+    text = "\n\n".join(messages)
+    content = [{"type": "text", "text": text}]
+    if image_b64:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{image_mime};base64,{image_b64}",
+                    "detail": "default",
+                },
+            }
+        )
+
+    payload = {
+        "model": MINIMAX_MODEL,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0.2,
+        "max_completion_tokens": 3000,
+        "thinking": {"type": "disabled"},
+    }
+    request = urllib.request.Request(
+        f"{MINIMAX_BASE_URL}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {MINIMAX_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=MINIMAX_TIMEOUT_SECONDS) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return {"text": f"MiniMax 请求失败：HTTP {exc.code} {detail}"}
+    except Exception as exc:
+        return {"text": f"MiniMax 请求失败：{exc}"}
+
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        text = json.dumps(data, ensure_ascii=False)
+    return {"text": text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)}
 
 
 def openai_responses(messages, image_b64=None, image_mime="image/jpeg"):
