@@ -1716,7 +1716,7 @@ def hot_sector_score(board):
     return round(score, 4)
 
 
-def hot_sector_snapshot(trade_date=None, max_boards=16):
+def hot_sector_snapshot(trade_date=None, max_boards=6):
     trade_date = previous_trading_date(trade_date or today_str())
     raw_boards = []
     errors = []
@@ -1798,10 +1798,13 @@ def hot_sector_snapshot(trade_date=None, max_boards=16):
             down = board.get("down_count_spot") or 0
             board["up_ratio"] = round(up / (up + down), 4) if up + down else None
         board["score"] = hot_sector_score(board)
+        amount_ratio = board.get("amount_vs_20d") or board.get("amount_vs_5d") or 0
+        breadth_available = board.get("up_ratio") is not None
+        board["breadth_available"] = breadth_available
         board["volume_price_rising"] = bool(
             (board.get("pct") or board.get("pct_spot") or 0) >= 1.5
-            and (board.get("amount_vs_20d") or board.get("amount_vs_5d") or 0) >= 1.3
-            and (board.get("up_ratio") or 0) >= 0.6
+            and amount_ratio >= 1.3
+            and (not breadth_available or (board.get("up_ratio") or 0) >= 0.6)
         )
         boards.append(board)
     boards.sort(key=lambda item: item.get("score") or -999, reverse=True)
@@ -1827,6 +1830,7 @@ def generate_hot_sector_report(trade_date=None):
         "你是 A 股热点板块盘后分析助手。不要承诺收益，不要给确定买入建议。\n"
         "用户重点关心：板块是否量价齐升、上涨是否有广度、龙头是谁、明天该观察什么触发条件。\n"
         "请严格基于结构化快照，不要编造不存在的数据。若某项数据缺失，要说明缺失。\n"
+        "如果 breadth_available=false 或 up_ratio=null，只能说“量价强但广度待确认”，不要写成上涨家数已确认。\n"
         "输出结构：\n"
         "1. 今日量价齐升板块：列 3-5 个，说明涨幅、成交额相对均值、上涨占比、均线状态。\n"
         "2. 龙头观察：每个重点板块点名 2-3 只龙头，解释是涨幅/成交额/换手/辨识度哪类强。\n"
