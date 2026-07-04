@@ -2877,9 +2877,7 @@ def import_positions_from_screenshot(payload):
             skipped.append({"index": index, "reason": "quantity must be positive", "item": item})
             continue
         if not stock_code and stock_name:
-            stock_code = lookup_stock_code(
-                stock_name, last_price or cost_price, allow_fund_lookup=False
-            ) or ""
+            stock_code = cached_stock_code(stock_name) or ""
         if not stock_code:
             skipped.append({"index": index, "reason": "stock_code is required", "item": item})
             continue
