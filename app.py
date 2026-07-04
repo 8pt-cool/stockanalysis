@@ -1713,6 +1713,13 @@ def normalize_image_type(image_type):
         "自选": "watchlist_snapshot",
         "自选股": "watchlist_snapshot",
         "优选": "watchlist_snapshot",
+        "position": "position_snapshot",
+        "positions": "position_snapshot",
+        "holding": "position_snapshot",
+        "holdings": "position_snapshot",
+        "持仓": "position_snapshot",
+        "仓位": "position_snapshot",
+        "持仓股": "position_snapshot",
         "auto": "auto",
         "自动": "auto",
     }
@@ -1762,12 +1769,22 @@ def screenshot_prompt(image_type):
             "返回结构：{\"type\":\"watchlist_snapshot\",\"items\":[{\"stock_code\":null,\"stock_name\":null,"
             "\"pct_change\":null,\"last_price\":null,\"board\":null,\"rank\":null,\"confidence\":0到1}],\"warnings\":[]}"
         )
+    if image_type == "position_snapshot":
+        return (
+            common
+            + "这类图片是券商/App 的持仓列表截图，通常每行包含股票名称、代码、持仓数量、成本价、现价、市值、盈亏或盈亏比例。\n"
+            "请只提取真实持仓股票，不要提取指数、自选栏目、按钮、账户汇总行。股票代码通常是 6 位数字；看不清的字段填 null。\n"
+            "quantity 必须是持仓数量/股票数量，不要用可买数量、成交金额或市值代替。cost_price 是成本价，last_price 是现价。\n"
+            "返回结构：{\"type\":\"position_snapshot\",\"positions\":[{\"stock_code\":null,\"stock_name\":null,"
+            "\"quantity\":null,\"cost_price\":null,\"last_price\":null,\"market_value\":null,\"pnl\":null,"
+            "\"pnl_pct\":null,\"position_type\":null,\"confidence\":0到1,\"raw_text\":null}],\"warnings\":[]}"
+        )
     return (
         common
         + "请先判断截图类型：intraday_sb（日内图上 S/B 点）、broker_records（券商成交记录列表）"
-        "或 watchlist_snapshot（自选股列表）。\n"
+        "、watchlist_snapshot（自选股列表）或 position_snapshot（持仓列表）。\n"
         "如果是日内 S/B 点，按 intraday_sb 结构输出；如果是券商成交记录合集，按 broker_records 结构输出；"
-        "如果是自选股列表，按 watchlist_snapshot 结构输出。"
+        "如果是自选股列表，按 watchlist_snapshot 结构输出；如果是持仓列表，按 position_snapshot 结构输出。"
     )
 
 
@@ -1775,6 +1792,8 @@ def infer_telegram_image_type(message):
     caption = (message.get("caption") or "").strip().lower()
     if any(token in caption for token in ("日内", "分时", "sb", "s/b", "k线", "kline", "intraday")):
         return "intraday_sb"
+    if any(token in caption for token in ("持仓", "仓位", "持仓股", "position", "positions", "holding", "holdings")):
+        return "position_snapshot"
     if any(token in caption for token in ("成交", "券商", "交割", "记录", "broker", "records")):
         return "broker_records"
     if any(token in caption for token in ("自选", "优选", "watchlist", "watch")):
@@ -1814,6 +1833,10 @@ def normalize_side(value):
 def as_number(value):
     if value is None or value == "":
         return None
+    if isinstance(value, str):
+        value = value.strip().replace(",", "")
+        if value.endswith("%"):
+            value = value[:-1].strip()
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -2082,6 +2105,108 @@ def normalize_watchlist_result(text):
         "type": "watchlist_snapshot",
         "recognition_source": parsed.get("recognition_source"),
         "items": items,
+        "warnings": parsed.get("warnings") or [],
+    }
+    return json.dumps(normalized, ensure_ascii=False, indent=2)
+
+
+def normalize_position_result(text):
+    parsed = parse_ai_json(text)
+    if not isinstance(parsed, dict) or parsed.get("type") != "position_snapshot":
+        return text
+    raw_positions = parsed.get("positions")
+    if raw_positions is None:
+        raw_positions = parsed.get("items") or parsed.get("data") or parsed.get("stocks") or []
+    if not isinstance(raw_positions, list):
+        return text
+
+    positions = []
+    for raw in raw_positions:
+        if not isinstance(raw, dict):
+            continue
+        stock_code = compact_stock_code(
+            raw.get("stock_code")
+            or raw.get("code")
+            or raw.get("证券代码")
+            or raw.get("代码")
+        )
+        stock_name = str(
+            raw.get("stock_name")
+            or raw.get("name")
+            or raw.get("证券名称")
+            or raw.get("名称")
+            or ""
+        ).strip()
+        quantity = as_int(
+            raw.get("quantity")
+            if raw.get("quantity") is not None
+            else raw.get("shares")
+            if raw.get("shares") is not None
+            else raw.get("持仓数量")
+            if raw.get("持仓数量") is not None
+            else raw.get("股票余额")
+        )
+        cost_price = as_number(
+            raw.get("cost_price")
+            if raw.get("cost_price") is not None
+            else raw.get("cost")
+            if raw.get("cost") is not None
+            else raw.get("成本价")
+            if raw.get("成本价") is not None
+            else raw.get("持仓成本")
+        )
+        last_price = as_number(
+            raw.get("last_price")
+            if raw.get("last_price") is not None
+            else raw.get("price")
+            if raw.get("price") is not None
+            else raw.get("现价")
+            if raw.get("现价") is not None
+            else raw.get("最新价")
+        )
+        market_value = as_number(
+            raw.get("market_value")
+            if raw.get("market_value") is not None
+            else raw.get("市值")
+            if raw.get("市值") is not None
+            else raw.get("持仓市值")
+        )
+        pnl = as_number(
+            raw.get("pnl")
+            if raw.get("pnl") is not None
+            else raw.get("profit")
+            if raw.get("profit") is not None
+            else raw.get("盈亏")
+            if raw.get("盈亏") is not None
+            else raw.get("浮动盈亏")
+        )
+        pnl_pct = as_number(
+            raw.get("pnl_pct")
+            if raw.get("pnl_pct") is not None
+            else raw.get("profit_pct")
+            if raw.get("profit_pct") is not None
+            else raw.get("盈亏比例")
+            if raw.get("盈亏比例") is not None
+            else raw.get("收益率")
+        )
+        positions.append(
+            {
+                "stock_code": stock_code or None,
+                "stock_name": stock_name or None,
+                "quantity": quantity,
+                "cost_price": cost_price,
+                "last_price": last_price,
+                "market_value": market_value,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "position_type": str(raw.get("position_type") or raw.get("类型") or "").strip() or None,
+                "confidence": raw.get("confidence"),
+                "raw_text": str(raw.get("raw_text") or raw.get("原文") or "").strip() or None,
+            }
+        )
+    normalized = {
+        "type": "position_snapshot",
+        "positions": positions,
         "warnings": parsed.get("warnings") or [],
     }
     return json.dumps(normalized, ensure_ascii=False, indent=2)
@@ -2600,6 +2725,14 @@ def watch_items_from_screenshot(screenshot):
     return [item for item in items if isinstance(item, dict)]
 
 
+def positions_from_screenshot(screenshot):
+    parsed = parse_ai_json(normalize_position_result(screenshot.get("ocr_json") or ""))
+    if not isinstance(parsed, dict) or parsed.get("type") != "position_snapshot":
+        return []
+    positions = parsed.get("positions") or []
+    return [item for item in positions if isinstance(item, dict)]
+
+
 def import_screenshot_trades(payload):
     screenshot_id = payload.get("screenshot_id")
     if not screenshot_id:
@@ -2706,6 +2839,71 @@ def import_watchlist_from_screenshot(payload):
     return {"imported": imported, "skipped": skipped}
 
 
+def import_positions_from_screenshot(payload):
+    screenshot_id = payload.get("screenshot_id")
+    if not screenshot_id:
+        raise ValueError("screenshot_id is required")
+    screenshot = get_screenshot(screenshot_id)
+    if not screenshot:
+        raise ValueError("screenshot not found")
+    positions = payload.get("positions")
+    if positions is None:
+        positions = positions_from_screenshot(screenshot)
+    if not isinstance(positions, list):
+        raise ValueError("positions must be a list")
+
+    imported = []
+    skipped = []
+    for index, item in enumerate(positions):
+        if not isinstance(item, dict):
+            skipped.append({"index": index, "reason": "invalid position item", "item": item})
+            continue
+        stock_code = compact_stock_code(item.get("stock_code"))
+        stock_name = str(item.get("stock_name") or "").strip()
+        last_price = as_number(item.get("last_price"))
+        cost_price = as_number(item.get("cost_price"))
+        if not stock_code and stock_name:
+            stock_code = lookup_stock_code(stock_name, last_price or cost_price) or ""
+        quantity = as_int(item.get("quantity"))
+        if not stock_code:
+            skipped.append({"index": index, "reason": "stock_code is required", "item": item})
+            continue
+        if quantity is None or quantity <= 0:
+            skipped.append({"index": index, "reason": "quantity must be positive", "item": item})
+            continue
+        note_parts = ["持仓截图导入"]
+        for label, value in (
+            ("现价", last_price),
+            ("市值", as_number(item.get("market_value"))),
+            ("盈亏", as_number(item.get("pnl"))),
+            ("盈亏率", as_number(item.get("pnl_pct"))),
+        ):
+            if value is not None:
+                note_parts.append(f"{label}:{value}")
+        raw_text = str(item.get("raw_text") or "").strip()
+        if raw_text:
+            note_parts.append(f"原文:{raw_text[:80]}")
+        imported.append(
+            upsert_position(
+                {
+                    "stock_code": stock_code,
+                    "stock_name": stock_name,
+                    "quantity": quantity,
+                    "cost_price": cost_price,
+                    "position_type": item.get("position_type") or "截图持仓",
+                    "notes": " ".join(note_parts),
+                }
+            )
+        )
+    if imported:
+        with db() as conn:
+            conn.execute(
+                "UPDATE screenshots SET imported_at = ? WHERE id = ?",
+                (now_iso(), screenshot_id),
+            )
+    return {"imported": imported, "skipped": skipped}
+
+
 def analyze_and_store_screenshot(image_bytes, ext="jpg", image_type="auto"):
     image_type = normalize_image_type(image_type)
     screenshot_id = str(uuid.uuid4())
@@ -2722,7 +2920,14 @@ def analyze_and_store_screenshot(image_bytes, ext="jpg", image_type="auto"):
         result_text = json.dumps(ocr_result, ensure_ascii=False, indent=2)
         result_text = normalize_broker_result(result_text)
         result_text = enrich_broker_result_codes(result_text)
-    elif isinstance(ocr_result, dict) and image_type in ("auto", "watchlist_snapshot"):
+    elif isinstance(ocr_result, dict) and ocr_result.get("type") == "position_snapshot":
+        result_text = json.dumps(ocr_result, ensure_ascii=False, indent=2)
+        result_text = normalize_position_result(result_text)
+    elif (
+        isinstance(ocr_result, dict)
+        and ocr_result.get("type") != "unknown"
+        and image_type in ("auto", "watchlist_snapshot", "position_snapshot")
+    ):
         result_text = json.dumps(ocr_result, ensure_ascii=False, indent=2)
     else:
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
@@ -2738,6 +2943,8 @@ def analyze_and_store_screenshot(image_bytes, ext="jpg", image_type="auto"):
             result_text = enrich_broker_result_codes(result_text)
         if image_type == "watchlist_snapshot" or "watchlist_snapshot" in result_text:
             result_text = normalize_watchlist_result(result_text)
+        if image_type == "position_snapshot" or "position_snapshot" in result_text:
+            result_text = normalize_position_result(result_text)
     with db() as conn:
         conn.execute(
             """
@@ -2918,6 +3125,7 @@ def screenshot_counts(screenshot):
             "orders": 0,
             "filled": 0,
             "watch_items": 0,
+            "positions": 0,
             "warnings": ["未解析到结构化结果"],
         }
     if parsed.get("type") == "broker_records":
@@ -2928,6 +3136,7 @@ def screenshot_counts(screenshot):
             "orders": len(orders),
             "filled": len(filled),
             "watch_items": 0,
+            "positions": 0,
             "warnings": parsed.get("warnings") or [],
         }
     if parsed.get("type") == "watchlist_snapshot":
@@ -2937,6 +3146,17 @@ def screenshot_counts(screenshot):
             "orders": 0,
             "filled": 0,
             "watch_items": len(items),
+            "positions": 0,
+            "warnings": parsed.get("warnings") or [],
+        }
+    if parsed.get("type") == "position_snapshot":
+        positions = [item for item in parsed.get("positions") or [] if isinstance(item, dict)]
+        return {
+            "type": "position_snapshot",
+            "orders": 0,
+            "filled": 0,
+            "watch_items": 0,
+            "positions": len(positions),
             "warnings": parsed.get("warnings") or [],
         }
     return {
@@ -2944,6 +3164,7 @@ def screenshot_counts(screenshot):
         "orders": 0,
         "filled": 0,
         "watch_items": 0,
+        "positions": 0,
         "warnings": parsed.get("warnings") or [parsed.get("reason") or "无法识别"],
     }
 
@@ -2964,6 +3185,8 @@ def format_screenshot_summary(screenshot):
         lines.append(f"真实成交：{counts['filled']} 条")
     elif counts["type"] == "watchlist_snapshot":
         lines.append(f"自选/股票项：{counts['watch_items']} 条")
+    elif counts["type"] == "position_snapshot":
+        lines.append(f"持仓项：{counts['positions']} 条")
     if counts["warnings"]:
         lines.append("提示：" + "；".join(str(item) for item in counts["warnings"][:2]))
     return "\n".join(lines)
@@ -3039,6 +3262,16 @@ def telegram_import_latest_text():
                 "最近截图导入完成。",
                 format_screenshot_summary(get_screenshot(screenshot["id"])),
                 f"导入自选：{len(result['imported'])} 只",
+                f"跳过：{len(result['skipped'])} 条",
+            ]
+        )
+    if counts["type"] == "position_snapshot":
+        result = import_positions_from_screenshot({"screenshot_id": screenshot["id"]})
+        return "\n".join(
+            [
+                "最近截图导入完成。",
+                format_screenshot_summary(get_screenshot(screenshot["id"])),
+                f"导入持仓：{len(result['imported'])} 只",
                 f"跳过：{len(result['skipped'])} 条",
             ]
         )
@@ -3229,6 +3462,7 @@ def telegram_help_text():
         "/watch 代码 名称 加入自选\n"
         "/list 查看自选股\n"
         "/position 代码 名称 数量 成本价 维护私有持仓\n"
+        "持仓截图 caption 写“持仓”后发送，再用 /import_latest 导入\n"
         "/positions 查看私有持仓\n"
         "/position_report 生成私有持仓日报\n"
         "/position_remove 代码 删除私有持仓\n"
