@@ -112,6 +112,12 @@ function extractWatchItems(screenshot) {
   return Array.isArray(parsed.items) ? parsed.items : [];
 }
 
+function extractPositions(screenshot) {
+  const parsed = parseJsonBlock(screenshot.ocr_json || "");
+  if (!parsed || parsed.type !== "position_snapshot") return [];
+  return Array.isArray(parsed.positions) ? parsed.positions : [];
+}
+
 function renderScreenshots(items) {
   const list = $("#screenshotList");
   list.innerHTML = "";
@@ -122,7 +128,9 @@ function renderScreenshots(items) {
   for (const shot of items) {
     const trades = extractFilledTrades(shot);
     const watchItems = extractWatchItems(shot);
+    const positions = extractPositions(shot);
     const isWatchlistShot = watchItems.length > 0;
+    const isPositionShot = positions.length > 0;
     const item = document.createElement("div");
     item.className = "item screenshotItem";
     item.dataset.screenshotId = shot.id;
@@ -147,15 +155,27 @@ function renderScreenshots(items) {
         <label>现价<input class="watchPrice" type="number" step="0.001" value="${escapeHtml(watch.last_price)}" /></label>
       </div>
     `).join("");
+    const positionRows = positions.map((position, index) => `
+      <div class="tradeConfirm positionConfirm" data-position-index="${index}">
+        <label>代码<input class="positionCode" inputmode="numeric" value="${escapeHtml(position.stock_code)}" placeholder="必填" /></label>
+        <label>名称<input class="positionName" value="${escapeHtml(position.stock_name)}" /></label>
+        <label>数量<input class="positionQuantity" type="number" step="1" value="${escapeHtml(position.quantity)}" placeholder="必填" /></label>
+        <label>成本<input class="positionCost" type="number" step="0.001" value="${escapeHtml(position.cost_price)}" /></label>
+        <label>现价<input class="positionLast" type="number" step="0.001" value="${escapeHtml(position.last_price)}" /></label>
+        <label>市值<input class="positionMarketValue" type="number" step="0.001" value="${escapeHtml(position.market_value)}" /></label>
+      </div>
+    `).join("");
     item.innerHTML = `
       <strong>${escapeHtml(shot.image_type || "screenshot")} · ${escapeHtml(status)}</strong>
-      <div class="meta">${escapeHtml(shot.created_at)} · ${trades.length} 条真实成交 · ${watchItems.length} 条自选股</div>
+      <div class="meta">${escapeHtml(shot.created_at)} · ${trades.length} 条真实成交 · ${watchItems.length} 条自选股 · ${positions.length} 条持仓</div>
       ${rows || ""}
       ${watchRows || ""}
-      ${rows || watchRows ? "" : '<p class="note">没有解析到可入库内容。可以展开原文核对。</p>'}
+      ${positionRows || ""}
+      ${rows || watchRows || positionRows ? "" : '<p class="note">没有解析到可入库内容。可以展开原文核对。</p>'}
       <div class="actions">
         <button class="confirmImportBtn primary" ${shot.imported_at || !trades.length ? "disabled" : ""}>确认入库</button>
         <button class="watchImportBtn primary" ${shot.imported_at || !isWatchlistShot ? "disabled" : ""}>导入自选</button>
+        <button class="positionImportBtn primary" ${shot.imported_at || !isPositionShot ? "disabled" : ""}>导入持仓</button>
         <button class="showRawBtn tiny">查看原文</button>
       </div>
       <pre class="output rawOutput" hidden>${escapeHtml(shot.ocr_json || "")}</pre>
@@ -198,6 +218,17 @@ function collectWatchItems(item) {
     stock_name: row.querySelector(".watchName").value.trim(),
     pct_change: row.querySelector(".watchPct").value.trim(),
     last_price: row.querySelector(".watchPrice").value,
+  }));
+}
+
+function collectPositions(item) {
+  return Array.from(item.querySelectorAll(".positionConfirm")).map((row) => ({
+    stock_code: row.querySelector(".positionCode").value.trim(),
+    stock_name: row.querySelector(".positionName").value.trim(),
+    quantity: row.querySelector(".positionQuantity").value,
+    cost_price: row.querySelector(".positionCost").value,
+    last_price: row.querySelector(".positionLast").value,
+    market_value: row.querySelector(".positionMarketValue").value,
   }));
 }
 
@@ -370,6 +401,38 @@ function initForms() {
       } catch (error) {
         event.target.disabled = false;
         event.target.textContent = "导入自选";
+        statusNode.textContent = `导入失败：${error.message}`;
+        setOutput("#uploadResult", error.message);
+      }
+    }
+    if (event.target.classList.contains("positionImportBtn")) {
+      event.target.disabled = true;
+      event.target.textContent = "导入中...";
+      let statusNode = item.querySelector(".importStatus");
+      if (!statusNode) {
+        statusNode = document.createElement("p");
+        statusNode.className = "note statusLine importStatus";
+        item.appendChild(statusNode);
+      }
+      statusNode.textContent = "正在导入持仓...";
+      try {
+        const data = await api("/api/import-position-screenshot", {
+          method: "POST",
+          body: JSON.stringify({
+            screenshot_id: item.dataset.screenshotId,
+            positions: collectPositions(item),
+          }),
+        });
+        setOutput(
+          "#uploadResult",
+          `持仓导入完成：${data.imported.length} 条\n跳过：${data.skipped.length} 条\n\n${JSON.stringify(data, null, 2)}`
+        );
+        statusNode.textContent = `持仓导入完成：${data.imported.length} 条，跳过：${data.skipped.length} 条`;
+        event.target.textContent = "已导入";
+        await refreshScreenshots();
+      } catch (error) {
+        event.target.disabled = false;
+        event.target.textContent = "导入持仓";
         statusNode.textContent = `导入失败：${error.message}`;
         setOutput("#uploadResult", error.message);
       }

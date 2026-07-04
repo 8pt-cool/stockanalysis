@@ -2862,14 +2862,14 @@ def import_positions_from_screenshot(payload):
         stock_name = str(item.get("stock_name") or "").strip()
         last_price = as_number(item.get("last_price"))
         cost_price = as_number(item.get("cost_price"))
-        if not stock_code and stock_name:
-            stock_code = lookup_stock_code(stock_name, last_price or cost_price) or ""
         quantity = as_int(item.get("quantity"))
-        if not stock_code:
-            skipped.append({"index": index, "reason": "stock_code is required", "item": item})
-            continue
         if quantity is None or quantity <= 0:
             skipped.append({"index": index, "reason": "quantity must be positive", "item": item})
+            continue
+        if not stock_code and stock_name:
+            stock_code = lookup_stock_code(stock_name, last_price or cost_price) or ""
+        if not stock_code:
+            skipped.append({"index": index, "reason": "stock_code is required", "item": item})
             continue
         note_parts = ["持仓截图导入"]
         for label, value in (
@@ -3063,6 +3063,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/import-watchlist-screenshot":
                 json_response(self, {"ok": True, **import_watchlist_from_screenshot(payload)})
+                return
+            if self.path == "/api/import-position-screenshot":
+                json_response(self, {"ok": True, **import_positions_from_screenshot(payload)})
                 return
             error_response(self, "not found", HTTPStatus.NOT_FOUND)
         except Exception as exc:
