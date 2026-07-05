@@ -2249,6 +2249,293 @@ def generate_hot_sector_report(trade_date=None):
     return result["text"]
 
 
+def wudao_stock_screener(arguments):
+    data = wudao_data(
+        "stock_screener",
+        {
+            **(arguments or {}),
+            "detailLevel": "standard",
+            "format": "json",
+        },
+    )
+    return data if isinstance(data, dict) else {}
+
+
+def wudao_sector_stock_counts(trade_date):
+    counts = {}
+    try:
+        data = wudao_data(
+            "sector_analysis",
+            {
+                "source": "industry",
+                "period": 20,
+                "strengthPeriod": 5,
+                "detailLevel": "standard",
+                "format": "json",
+            },
+        )
+    except Exception as exc:
+        return counts, f"行业成分数快照失败：{exc}"
+    for rows in (data.get("topLists") or {}).values():
+        for row in rows or []:
+            name = str(row.get("name") or "").strip()
+            count = as_int(row.get("stockCount"))
+            if name and count:
+                counts[name] = count
+    return counts, None
+
+
+def momentum_snapshot(trade_date=None, top_n=200):
+    if not wudao_available():
+        return {
+            "type": "momentum_snapshot",
+            "ok": False,
+            "error": "悟道 MCP 未配置，无法生成 20 日动量模型。",
+        }
+    trade_date = previous_trading_date(trade_date or today_str())
+    errors = []
+    rank_limit = min(max(int(top_n or 200), 1), 200)
+    try:
+        rank_data = wudao_data(
+            "stock_rank",
+            {
+                "type": "gainers_20d",
+                "market": "all",
+                "limit": rank_limit,
+                "detailLevel": "standard",
+                "format": "json",
+            },
+        )
+    except Exception as exc:
+        return {
+            "type": "momentum_snapshot",
+            "ok": False,
+            "date": trade_date,
+            "error": f"悟道 20 日涨幅榜拉取失败：{exc}",
+        }
+    rank_rows = rank_data.get("rows") or []
+    codes = [compact_stock_code(row.get("code")) for row in rank_rows if row.get("code")]
+    codes = [code for code in codes if code]
+    if not codes:
+        return {
+            "type": "momentum_snapshot",
+            "ok": False,
+            "date": trade_date,
+            "error": "悟道未返回 20 日涨幅榜股票。",
+        }
+
+    try:
+        screener = wudao_stock_screener(
+            {
+                "date": trade_date,
+                "codes": codes,
+                "recentNdChgDays": 20,
+                "limit": min(len(codes), 300),
+            }
+        )
+        stock_rows = screener.get("rows") or []
+    except Exception as exc:
+        errors.append(f"股票行业补全失败：{exc}")
+        stock_rows = []
+
+    by_code = {compact_stock_code(row.get("code")): row for row in stock_rows if row.get("code")}
+    rank_meta_by_code = {
+        compact_stock_code(row.get("code")): row for row in rank_rows if row.get("code")
+    }
+    normalized = []
+    for code in codes:
+        row = by_code.get(code)
+        if not row:
+            continue
+        rank_meta = rank_meta_by_code.get(code) or {}
+        industry = str(row.get("industry") or "未分类").strip() or "未分类"
+        if as_number(row.get("ma20")) is None:
+            continue
+        normalized.append(
+            {
+                "rank": as_int(rank_meta.get("rank")),
+                "code": code,
+                "name": row.get("name") or rank_meta.get("name"),
+                "industry": industry,
+                "rank_change_percent": as_number(rank_meta.get("changePercent")),
+                "close": as_number(row.get("close")),
+                "amount_yi": as_number(row.get("amountYi")),
+                "turnover": as_number(row.get("turnoverRate")),
+                "volume_ratio": as_number(row.get("volumeRatio")),
+            }
+        )
+
+    groups = {}
+    for row in normalized:
+        groups.setdefault(row["industry"], []).append(row)
+
+    industry_totals, industry_count_error = wudao_sector_stock_counts(trade_date)
+    if industry_count_error:
+        errors.append(industry_count_error)
+
+    sectors = []
+    for industry, items in groups.items():
+        listed = len(items)
+        total = industry_totals.get(industry)
+        listed_ratio = round(listed / total, 4) if total else None
+        score = round(listed * listed_ratio, 4) if listed_ratio is not None else None
+        avg_rank = mean([item.get("rank") for item in items])
+        leaders = sorted(items, key=lambda item: item.get("rank") or 999999)[:5]
+        sectors.append(
+            {
+                "industry": industry,
+                "listed_count": listed,
+                "member_count": total,
+                "listed_ratio": listed_ratio,
+                "momentum_score": score,
+                "avg_rank": avg_rank,
+                "leaders": leaders,
+            }
+        )
+    sectors.sort(
+        key=lambda item: (
+            item.get("momentum_score") is not None,
+            item.get("momentum_score") or -999,
+            item.get("listed_count") or 0,
+        ),
+        reverse=True,
+    )
+    for index, sector in enumerate(sectors, 1):
+        sector["rank"] = index
+
+    return {
+        "type": "momentum_snapshot",
+        "ok": True,
+        "date": trade_date,
+        "source": "wudao_mcp_stock_rank_gainers_20d",
+        "period_days": 20,
+        "requested_top_n": 700,
+        "actual_top_n": rank_limit,
+        "limitations": [
+            "悟道 stock_rank 单次最多返回 200 只，当前为 Top200 近似版；PDF 原版为 Top700。",
+            "机构持股 >=2% 或北向持股 >=0.5% 过滤暂未启用，因为当前数据源未提供对应筛选字段。",
+            "上市不足 20 日的剔除以是否存在 MA20/20日涨幅字段近似判断。",
+            "代码池补全接口暂不返回个股 20 日涨幅数值，代表个股以 20 日涨幅榜名次展示。",
+            "行业成分总数来自 sector_analysis 单次快照；未覆盖行业不强行动量分值，避免逐行业查询耗尽 API 额度。",
+        ],
+        "errors": errors,
+        "stock_count": len(normalized),
+        "sectors": sectors,
+    }
+
+
+def format_percent(value):
+    if value is None:
+        return "缺失"
+    return f"{value * 100:.2f}%"
+
+
+def format_signed_pct(value):
+    if value is None:
+        return "缺失"
+    return f"{value:+.2f}%"
+
+
+def generate_momentum_report(trade_date=None):
+    snapshot = momentum_snapshot(trade_date)
+    if not snapshot.get("ok"):
+        return f"20日动量模型\n\n生成失败：{snapshot.get('error') or '未知错误'}"
+    date = snapshot.get("date")
+    sectors = snapshot.get("sectors") or []
+    valid_sectors = [item for item in sectors if item.get("momentum_score") is not None]
+    mainlines = [item for item in valid_sectors if (item.get("momentum_score") or 0) > 1]
+    climax = [item for item in valid_sectors if (item.get("momentum_score") or 0) >= 7]
+    lines = [
+        f"20日动量模型 {date}",
+        "",
+        "模型口径：",
+        f"- 取全市场 20 日涨幅榜前 {snapshot.get('actual_top_n')} 只，按行业聚合。",
+        "- 动量分值 = 上榜数量 x 上榜占比；上榜占比 = 上榜数量 / 行业成分总数。",
+        "- 分值 > 1 视为具备板块效应；分值 >= 7 视为接近高潮，需要结合量价择时谨慎判断。",
+        "- 当前为悟道 Top200 近似版，暂未启用机构/北向持仓过滤。",
+        "",
+        "动量排名：",
+    ]
+    if not valid_sectors:
+        lines.append("没有生成可排序的行业动量数据。")
+    for sector in valid_sectors[:12]:
+        leaders = "、".join(
+            [
+                f"{item.get('name')}({item.get('code')}, 榜单#{item.get('rank')}, 当日{format_signed_pct(item.get('rank_change_percent'))})"
+                for item in (sector.get("leaders") or [])[:3]
+            ]
+        )
+        tag = ""
+        if (sector.get("momentum_score") or 0) >= 7:
+            tag = " | 高潮警戒"
+        elif (sector.get("momentum_score") or 0) > 1:
+            tag = " | 主线候选"
+        lines.append(
+            f"{sector.get('rank')}. {sector.get('industry')}："
+            f"分值 {sector.get('momentum_score'):.2f}，"
+            f"上榜 {sector.get('listed_count')}/{sector.get('member_count')}，"
+            f"占比 {format_percent(sector.get('listed_ratio'))}，"
+            f"平均榜单名次 {sector.get('avg_rank'):.1f}{tag}"
+        )
+        if leaders:
+            lines.append(f"   代表个股：{leaders}")
+
+    lines.extend(["", "主线判断："])
+    if mainlines:
+        lines.append(
+            "具备板块效应的方向："
+            + "、".join(
+                [
+                    f"{item.get('industry')}({item.get('momentum_score'):.2f})"
+                    for item in mainlines[:8]
+                ]
+            )
+        )
+    else:
+        lines.append("当前 Top200 口径下，没有分值大于 1 的明确动量主线。")
+    if climax:
+        lines.append(
+            "高潮警戒方向："
+            + "、".join(
+                [
+                    f"{item.get('industry')}({item.get('momentum_score'):.2f})"
+                    for item in climax[:5]
+                ]
+            )
+            + "。分值过高不代表还能追，要交给量价择时确认。"
+        )
+
+    lines.extend(
+        [
+            "",
+            "使用方式：",
+            "- 这个模型只解决方向选择，不解决买卖点。",
+            "- 后续买点仍要看你原来的量价择时：回踩不破、放量突破、缩量企稳等触发条件。",
+            "- 如果某方向动量前排但最近 5 日转弱，优先视为强趋势里的分歧，不直接追高。",
+        ]
+    )
+    if snapshot.get("errors"):
+        lines.extend(["", "数据提示："] + [f"- {item}" for item in snapshot.get("errors")[:5]])
+
+    report = "\n".join(lines)
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO daily_stock_reports
+            (id, report_date, market_data_json, ai_summary, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                date,
+                json.dumps(snapshot, ensure_ascii=False, default=str),
+                report,
+                now_iso(),
+            ),
+        )
+    return report
+
+
 def sector_watch_groups():
     groups = {}
     for item in list_watchlist():
@@ -3815,6 +4102,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 trade_date = payload.get("date") or payload.get("report_date") or today_str()
                 json_response(self, {"ok": True, "report": generate_hot_sector_report(trade_date)})
                 return
+            if self.path == "/api/momentum-report":
+                trade_date = payload.get("date") or payload.get("report_date") or today_str()
+                json_response(self, {"ok": True, "report": generate_momentum_report(trade_date)})
+                return
             if self.path == "/api/import-screenshot-trades":
                 json_response(self, {"ok": True, **import_screenshot_trades(payload)})
                 return
@@ -4220,6 +4511,7 @@ def telegram_help_text():
         "/report yesterday 重算昨天自选股日报\n"
         "/sector 生成 AI 赛道轮动报告\n"
         "/hot_sectors 生成当日 A 股热点板块分析\n"
+        "/momentum 生成 20 日动量模型\n"
         "/watch 代码 名称 加入自选\n"
         "/list 查看自选股\n"
         "/position 代码 名称 数量 成本价 维护私有持仓\n"
@@ -4320,6 +4612,10 @@ def handle_telegram_message(message):
         target = parse_telegram_date_arg(text, today_str())
         telegram_send(chat_id, f"开始生成 {target} A 股热点板块分析，请稍等。")
         telegram_send(chat_id, generate_hot_sector_report(target))
+    elif text.startswith("/momentum"):
+        target = parse_telegram_date_arg(text, today_str())
+        telegram_send(chat_id, f"开始生成 {target} 20 日动量模型，请稍等。")
+        telegram_send(chat_id, generate_momentum_report(target))
     elif message.get("photo"):
         photos = message["photo"]
         largest = max(photos, key=lambda item: item.get("file_size", 0))

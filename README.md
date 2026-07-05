@@ -115,6 +115,9 @@ stored with `sector_name` and `sector_rank`. Use `/sector` in Telegram or
 `POST /api/sector-report` to generate a sector rotation report focused on
 weak-but-stabilizing subsectors and low-absorption watch candidates.
 
+Use `/momentum` in Telegram or `POST /api/momentum-report` to generate the
+20-day 3L momentum model based on the Wudao A-share data source.
+
 For Telegram photo uploads, add a caption to force the mode:
 
 ```text
