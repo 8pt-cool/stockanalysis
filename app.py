@@ -74,6 +74,9 @@ POSITION_REPORT_TIME = os.getenv("POSITION_REPORT_TIME", "17:35")
 MARKET_DATA_PROVIDER = os.getenv("MARKET_DATA_PROVIDER", "akshare").strip().lower()
 MARKET_LOOKBACK_DAYS = int(os.getenv("MARKET_LOOKBACK_DAYS", "90"))
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
+WUDAO_API_KEY = os.getenv("WUDAO_API_KEY", "")
+WUDAO_MCP_URL = os.getenv("WUDAO_MCP_URL", "https://stock.quicktiny.cn/api/mcp").strip()
+WUDAO_TIMEOUT_SECONDS = int(os.getenv("WUDAO_TIMEOUT_SECONDS", "45"))
 LOCAL_OCR_ENABLED = os.getenv("LOCAL_OCR_ENABLED", "true").lower() in (
     "1",
     "true",
@@ -711,6 +714,13 @@ def tushare_ts_code(stock_code):
 def is_china_market_trading_day(value):
     trade_date = str(value or today_str())
     cal_date = yyyymmdd(trade_date)
+    if wudao_available():
+        try:
+            result = wudao_trading_day(trade_date)
+            if result is not None:
+                return result
+        except Exception as exc:
+            print(f"Wudao trading calendar check failed, falling back: {exc}")
     if TUSHARE_TOKEN:
         try:
             import tushare as ts
@@ -800,6 +810,159 @@ def fetch_tushare_daily(stock_code, end_date, lookback_days=MARKET_LOOKBACK_DAYS
     return {"ok": True, "frame": frame, "provider": "tushare_qfq"}
 
 
+def wudao_available():
+    return bool(WUDAO_API_KEY and WUDAO_MCP_URL)
+
+
+def wudao_json_rpc(method, params=None, request_id=None):
+    if not wudao_available():
+        raise RuntimeError("悟道 MCP 未配置：请设置 WUDAO_API_KEY")
+    payload = {
+        "jsonrpc": "2.0",
+        "id": request_id or str(uuid.uuid4()),
+        "method": method,
+        "params": params or {},
+    }
+    request = urllib.request.Request(
+        WUDAO_MCP_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "Authorization": f"Bearer {WUDAO_API_KEY}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=WUDAO_TIMEOUT_SECONDS) as response:
+        body = response.read().decode("utf-8", errors="replace")
+    result = json.loads(body)
+    if result.get("error"):
+        raise RuntimeError(json.dumps(result["error"], ensure_ascii=False))
+    return result.get("result")
+
+
+def wudao_initialize():
+    return wudao_json_rpc(
+        "initialize",
+        {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "stockanalysis", "version": "0.1"},
+        },
+        request_id="initialize",
+    )
+
+
+def parse_wudao_content(result):
+    content = (result or {}).get("content") or []
+    if not content:
+        return result
+    text = content[0].get("text") if isinstance(content[0], dict) else None
+    if not text:
+        return result
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"text": text}
+
+
+def wudao_call_tool(name, arguments=None):
+    wudao_initialize()
+    result = wudao_json_rpc(
+        "tools/call",
+        {"name": name, "arguments": arguments or {}},
+        request_id=f"tool-{name}",
+    )
+    parsed = parse_wudao_content(result)
+    if isinstance(parsed, dict) and parsed.get("success") is False:
+        raise RuntimeError(json.dumps(parsed, ensure_ascii=False)[:1000])
+    return parsed
+
+
+def wudao_data(tool_name, arguments=None):
+    parsed = wudao_call_tool(tool_name, arguments)
+    if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict):
+        return parsed["data"]
+    if isinstance(parsed, dict):
+        return parsed
+    return {"raw": parsed}
+
+
+def wudao_trading_day(value):
+    data = wudao_data(
+        "trading_calendar",
+        {"date": value, "detailLevel": "standard", "format": "json"},
+    )
+    if "isTradingDay" in data:
+        return bool(data.get("isTradingDay"))
+    headline = str(data.get("headline") or "")
+    if "非交易日" in headline:
+        return False
+    if "交易日" in headline:
+        return True
+    return None
+
+
+def normalize_wudao_date(value):
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{8}", text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return text
+
+
+def fetch_wudao_daily(stock_code, end_date, lookback_days=MARKET_LOOKBACK_DAYS):
+    if not wudao_available():
+        return {"ok": False, "error": "悟道 MCP 未配置：请在 .env 设置 WUDAO_API_KEY"}
+    try:
+        import pandas as pd
+    except ImportError:
+        return {
+            "ok": False,
+            "error": "pandas 未安装，无法整理悟道 K 线数据",
+        }
+    try:
+        data = wudao_data(
+            "kline",
+            {
+                "code": compact_stock_code(stock_code),
+                "days": max(lookback_days, 90),
+                "endDate": end_date,
+                "adjust": "qfq",
+                "detailLevel": "standard",
+                "maxRows": max(lookback_days, 90),
+                "format": "json",
+            },
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"悟道 MCP 拉取失败：{exc}"}
+    rows = data.get("rows") if isinstance(data, dict) else None
+    if not rows:
+        return {"ok": False, "error": f"悟道 MCP 未返回 {stock_code} 的日 K 数据"}
+    normalized = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized.append(
+            {
+                "日期": normalize_wudao_date(row.get("date") or row.get("tradeDate")),
+                "开盘": as_number(first_present(row, ("open", "开盘"))),
+                "收盘": as_number(first_present(row, ("close", "收盘"))),
+                "最高": as_number(first_present(row, ("high", "最高"))),
+                "最低": as_number(first_present(row, ("low", "最低"))),
+                "涨跌幅": as_number(first_present(row, ("pct_chg", "pctChg", "changePercent", "涨跌幅"))),
+                "成交量": as_number(first_present(row, ("volume", "vol", "成交量"))),
+                "成交额": as_number(first_present(row, ("amount", "成交额"))),
+                "换手率": as_number(first_present(row, ("turnoverRate", "turnover", "换手率"))),
+            }
+        )
+    frame = pd.DataFrame([row for row in normalized if row.get("日期")])
+    if frame.empty:
+        return {"ok": False, "error": f"悟道 MCP 返回 {stock_code} 的 K 线为空"}
+    frame = frame.sort_values("日期")
+    return {"ok": True, "frame": frame, "provider": "wudao_mcp_qfq"}
+
+
 def fetch_akshare_daily(stock_code, end_date, lookback_days=MARKET_LOOKBACK_DAYS):
     try:
         import akshare as ak
@@ -849,6 +1012,28 @@ def fetch_akshare_daily(stock_code, end_date, lookback_days=MARKET_LOOKBACK_DAYS
 
 def fetch_market_daily(stock_code, end_date):
     provider = MARKET_DATA_PROVIDER
+    if provider == "wudao":
+        result = fetch_wudao_daily(stock_code, end_date)
+        if result.get("ok"):
+            return result
+        tushare_fallback = fetch_tushare_daily(stock_code, end_date)
+        if tushare_fallback.get("ok"):
+            tushare_fallback["provider"] = "tushare_fallback"
+            tushare_fallback["fallback_reason"] = result.get("error")
+            return tushare_fallback
+        akshare_fallback = fetch_akshare_daily(stock_code, end_date)
+        if akshare_fallback.get("ok"):
+            akshare_fallback["provider"] = "akshare_fallback"
+            akshare_fallback["fallback_reason"] = result.get("error")
+            return akshare_fallback
+        return {
+            "ok": False,
+            "stock_code": stock_code,
+            "error": (
+                f"{result.get('error')}；Tushare fallback 失败：{tushare_fallback.get('error')}；"
+                f"AKShare fallback 也失败：{akshare_fallback.get('error')}"
+            ),
+        }
     if provider == "akshare":
         result = fetch_akshare_daily(stock_code, end_date)
         if not result.get("ok"):
@@ -868,7 +1053,29 @@ def fetch_market_daily(stock_code, end_date):
             "stock_code": stock_code,
             "error": f"{result.get('error')}；AKShare fallback 也失败：{fallback.get('error')}",
         }
-    if provider in ("auto", "tushare_akshare"):
+    if provider in ("auto", "wudao_auto", "wudao_tushare_akshare"):
+        result = fetch_wudao_daily(stock_code, end_date)
+        if result.get("ok"):
+            return result
+        fallback = fetch_tushare_daily(stock_code, end_date)
+        if fallback.get("ok"):
+            fallback["provider"] = "tushare_fallback"
+            fallback["fallback_reason"] = result.get("error")
+            return fallback
+        fallback2 = fetch_akshare_daily(stock_code, end_date)
+        if fallback2.get("ok"):
+            fallback2["provider"] = "akshare_fallback"
+            fallback2["fallback_reason"] = f"{result.get('error')}；{fallback.get('error')}"
+            return fallback2
+        return {
+            "ok": False,
+            "stock_code": stock_code,
+            "error": (
+                f"{result.get('error')}；Tushare fallback 失败：{fallback.get('error')}；"
+                f"AKShare fallback 也失败：{fallback2.get('error')}"
+            ),
+        }
+    if provider == "tushare_akshare":
         result = fetch_tushare_daily(stock_code, end_date)
         if result.get("ok"):
             return result
@@ -914,12 +1121,15 @@ def market_context_for_stock(stock_code, trade_date, trades=None):
     latest = recent[-1]
     closes = [as_number(row.get("收盘")) for row in recent]
     volumes = [as_number(row.get("成交量")) for row in recent]
+    amounts = [as_number(row.get("成交额")) for row in recent]
     high = as_number(latest.get("最高"))
     low = as_number(latest.get("最低"))
     close = as_number(latest.get("收盘"))
     open_price = as_number(latest.get("开盘"))
     volume = as_number(latest.get("成交量"))
+    amount = as_number(latest.get("成交额"))
     volume_20_avg = mean(volumes[-20:])
+    amount_20_avg = mean(amounts[-20:])
     prev_close = closes[-2] if len(closes) >= 2 else None
     pct_change = (
         round((close - prev_close) / prev_close * 100, 4)
@@ -955,13 +1165,16 @@ def market_context_for_stock(stock_code, trade_date, trades=None):
         "close": close,
         "pct_change": pct_change,
         "volume": volume,
-        "amount": as_number(latest.get("成交额")),
+        "amount": amount,
         "turnover_rate": as_number(latest.get("换手率")),
         "ma5": mean(closes[-5:]),
         "ma10": mean(closes[-10:]),
         "ma20": mean(closes[-20:]),
         "volume_vs_20d_avg": round(volume / volume_20_avg, 4)
         if volume is not None and volume_20_avg
+        else None,
+        "amount_vs_20d_avg": round(amount / amount_20_avg, 4)
+        if amount is not None and amount_20_avg
         else None,
         "trade_points": trade_points,
     }
@@ -1017,7 +1230,8 @@ def compact_market_context(context):
         "ma5": context.get("ma5"),
         "ma10": context.get("ma10"),
         "ma20": context.get("ma20"),
-        "vol20": context.get("volume_vs_20d_avg"),
+        "vol20": context.get("volume_vs_20d_avg") or context.get("amount_vs_20d_avg"),
+        "vol20_basis": "volume" if context.get("volume_vs_20d_avg") is not None else "amount",
     }
 
 
@@ -1716,7 +1930,172 @@ def hot_sector_score(board):
     return round(score, 4)
 
 
-def hot_sector_snapshot(trade_date=None, max_boards=6):
+def wudao_hot_sector_snapshot(trade_date=None, max_boards=10):
+    if not wudao_available():
+        raise RuntimeError("悟道 MCP 未配置：请设置 WUDAO_API_KEY")
+    trade_date = previous_trading_date(trade_date or today_str())
+    errors = []
+    hot_rows = []
+    capital_rows = []
+    ranking_rows = []
+    market_overview = None
+    try:
+        hot_data = wudao_data(
+            "hot_sectors",
+            {
+                "date": trade_date,
+                "detailLevel": "standard",
+                "maxRowsPerLevel": 8,
+                "includeFirstBoard": True,
+                "includeReasonInfo": True,
+                "format": "json",
+            },
+        )
+        hot_rows = hot_data.get("rows") or []
+    except Exception as exc:
+        errors.append(f"悟道热点题材失败：{exc}")
+    try:
+        capital_data = wudao_data(
+            "theme_intraday_capital",
+            {
+                "tradeDate": trade_date,
+                "limit": 80,
+                "detailLevel": "standard",
+                "format": "json",
+            },
+        )
+        capital_rows = capital_data.get("rows") or []
+    except Exception as exc:
+        errors.append(f"悟道板块资金失败：{exc}")
+    try:
+        ranking_data = wudao_data(
+            "concept_ranking",
+            {
+                "type": "concept",
+                "sortBy": "limitUpNum",
+                "limit": 80,
+                "detailLevel": "standard",
+                "format": "json",
+            },
+        )
+        ranking_rows = ranking_data.get("rows") or []
+    except Exception as exc:
+        errors.append(f"悟道概念排行失败：{exc}")
+    try:
+        market_overview = wudao_data(
+            "market_overview",
+            {"date": trade_date, "detailLevel": "standard", "format": "json"},
+        )
+    except Exception as exc:
+        errors.append(f"悟道市场宽度失败：{exc}")
+
+    capital_by_name = {
+        clean_board_name(row.get("themeName")): row
+        for row in capital_rows
+        if isinstance(row, dict) and row.get("themeName")
+    }
+    ranking_by_name = {
+        clean_board_name(row.get("name")): row
+        for row in ranking_rows
+        if isinstance(row, dict) and row.get("name")
+    }
+
+    candidate_names = []
+    for rows, key in ((hot_rows, "name"), (capital_rows, "themeName"), (ranking_rows, "name")):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = clean_board_name(row.get(key))
+            if name and name not in candidate_names:
+                candidate_names.append(name)
+
+    boards = []
+    for name in candidate_names[:max_boards]:
+        hot = next(
+            (
+                row
+                for row in hot_rows
+                if isinstance(row, dict) and clean_board_name(row.get("name")) == name
+            ),
+            {},
+        )
+        capital = capital_by_name.get(name) or {}
+        ranking = ranking_by_name.get(name) or {}
+        pct = as_number(
+            first_present(
+                {**ranking, **hot, **capital},
+                ("changePercent", "pctChg", "pct", "涨跌幅"),
+            )
+        )
+        stock_count = as_int(ranking.get("stockCount")) or as_int(hot.get("stockCount"))
+        up_count = as_int(first_present(ranking, ("upNum", "上涨家数")))
+        up_ratio = round(up_count / stock_count, 4) if up_count is not None and stock_count else None
+        leaders = []
+        for item in (hot.get("coreStocks") or [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            leaders.append(
+                {
+                    "code": compact_stock_code(item.get("code")),
+                    "name": item.get("name"),
+                    "continue_num": as_int(item.get("continueNum")),
+                    "reason": item.get("reasonType"),
+                    "source": "wudao_hot_sectors",
+                }
+            )
+        board = {
+            "kind": "concept",
+            "kind_name": "题材",
+            "name": name,
+            "source": "wudao_mcp",
+            "pct": pct,
+            "pct_spot": pct,
+            "amount_spot": as_number(capital.get("amount")),
+            "amount_text": capital.get("amountText"),
+            "amount_vs_20d": as_number(capital.get("volumeRatio")),
+            "volume_vs_20d": as_number(capital.get("volumeRatio")),
+            "main_net_amount": as_number(capital.get("mainNetAmount")),
+            "main_net_amount_text": capital.get("mainNetAmountText"),
+            "big_order_net_amount": as_number(capital.get("bigOrderNetAmount")),
+            "big_order_net_amount_text": capital.get("bigOrderNetAmountText"),
+            "limit_up_num": as_int(hot.get("limitUpNum") or ranking.get("limitUpNum")),
+            "continuous_plate_num": as_int(hot.get("continuousPlateNum")),
+            "high_board": hot.get("highBoard"),
+            "member_count": stock_count,
+            "up_count": up_count,
+            "up_ratio": up_ratio,
+            "fundflow": as_number(ranking.get("fundflow")),
+            "leaders": leaders,
+            "breadth_available": up_ratio is not None,
+        }
+        board["score"] = hot_sector_score(board)
+        amount_ratio = board.get("amount_vs_20d") or 0
+        board["volume_price_rising"] = bool(
+            (board.get("pct") or 0) >= 1.5
+            and amount_ratio >= 1.0
+            and (board.get("up_ratio") is None or (board.get("up_ratio") or 0) >= 0.6)
+        )
+        boards.append(board)
+
+    boards.sort(
+        key=lambda item: (
+            item.get("volume_price_rising") is True,
+            item.get("score") or -999,
+            item.get("limit_up_num") or 0,
+        ),
+        reverse=True,
+    )
+    return {
+        "type": "hot_sector_snapshot",
+        "date": trade_date,
+        "source": "wudao_mcp_hot_sectors",
+        "errors": errors,
+        "market_overview": market_overview,
+        "boards": boards[:10],
+    }
+
+
+def akshare_hot_sector_snapshot(trade_date=None, max_boards=6):
     trade_date = previous_trading_date(trade_date or today_str())
     raw_boards = []
     errors = []
@@ -1815,6 +2194,18 @@ def hot_sector_snapshot(trade_date=None, max_boards=6):
         "errors": errors,
         "boards": boards[:10],
     }
+
+
+def hot_sector_snapshot(trade_date=None, max_boards=6):
+    if wudao_available():
+        try:
+            return wudao_hot_sector_snapshot(trade_date, max_boards=max(10, max_boards))
+        except Exception as exc:
+            fallback = akshare_hot_sector_snapshot(trade_date, max_boards=max_boards)
+            fallback.setdefault("errors", []).insert(0, f"悟道 MCP fallback：{exc}")
+            fallback["source"] = f"{fallback.get('source')}_after_wudao_error"
+            return fallback
+    return akshare_hot_sector_snapshot(trade_date, max_boards=max_boards)
 
 
 def generate_hot_sector_report(trade_date=None):

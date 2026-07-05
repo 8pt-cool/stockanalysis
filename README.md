@@ -58,6 +58,8 @@ DAILY_REPORT_TIME=17:30
 
 MARKET_DATA_PROVIDER=tushare
 MARKET_LOOKBACK_DAYS=90
+WUDAO_API_KEY=
+WUDAO_MCP_URL=https://stock.quicktiny.cn/api/mcp
 ```
 
 Set `TEXT_AI_PROVIDER=deepseek` to use DeepSeek for text reviews and reports.
@@ -149,6 +151,11 @@ python3 -m pip install -r requirements.txt
 With `MARKET_DATA_PROVIDER=tushare`, trade reviews fetch recent A-share daily
 K-line data with Tushare and fall back to AKShare if Tushare is unavailable.
 Set `TUSHARE_TOKEN` in `.env` before using Tushare.
+
+With `MARKET_DATA_PROVIDER=wudao`, trade reviews fetch front-adjusted daily
+K-line data from the Wudao A-share MCP and fall back to Tushare, then AKShare.
+With `MARKET_DATA_PROVIDER=auto`, the app tries Wudao first, then Tushare, then
+AKShare. Hot sector reports automatically try Wudao when `WUDAO_API_KEY` is set.
 
 The app calculates:
 
