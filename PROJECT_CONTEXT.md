@@ -12,8 +12,11 @@ account identifiers in this file.
 - Telegram bot integration.
 - Screenshot upload and AI-assisted extraction.
 - Manual trade and watchlist management.
+- Private position management and owner-only position reports.
 - Daily watchlist reports.
 - Sector rotation reports for AI infrastructure subsectors.
+- A-share hot sector reports.
+- 20-day 3L momentum model reports.
 - SQLite persistence.
 
 The app is a review and discipline tool. It does not place trades and does not
@@ -60,17 +63,28 @@ Current intended configuration:
 
 ```text
 TEXT_AI_PROVIDER=deepseek
-VISION_AI_PROVIDER=local
-MARKET_DATA_PROVIDER=tushare
+VISION_AI_PROVIDER=minimax
+MARKET_DATA_PROVIDER=auto
 DAILY_REPORT_TIME=17:30
+POSITION_REPORT_TIME=17:35
 ```
 
 DeepSeek is used for text reviews and daily reports.
-Tushare is the primary market data source, with AKShare fallback.
-Local LM Studio is used for vision/screenshot recognition on the Mac runtime.
+Market data tries Wudao A-share MCP first, then Tushare, then AKShare.
+MiniMax is the intended cloud vision provider for screenshot recognition on the
+VPS. Local LM Studio can still be used for vision/screenshot recognition on the
+Mac runtime, but it is too slow and is not available on the small VPS.
 
-Do not commit `.env`. It contains Telegram, DeepSeek, Tushare, and other private
-configuration.
+Do not commit `.env`. It contains Telegram, DeepSeek, Tushare, Wudao, and other
+private configuration.
+
+Wudao MCP:
+
+- Stable URL: `https://stock.quicktiny.cn/api/mcp`
+- Use regular HTTP/stateless JSON-RPC with `Authorization: Bearer ...`
+- Do not use the stream URL unless the client explicitly supports it.
+- The Codex global MCP server name is `wudao`, but the app also has its own
+  direct JSON-RPC client so Docker/cloud can call Wudao without Codex.
 
 ## Daily Watchlist Report Behavior
 
@@ -137,8 +151,80 @@ Reports:
 - `daily_stock_reports.market_data_json.type == "watch_report"` identifies
   normal watchlist reports.
 - `type == "sector_rotation"` identifies sector rotation reports.
+- `type == "hot_sector_snapshot"` identifies hot sector reports.
+- `type == "momentum_snapshot"` identifies 20-day momentum model reports.
+- `type == "position_report"` identifies owner-only private position reports.
 - Watch reports store coverage, previous focus review, focus items, watch items,
   and compact market context.
+
+Screenshot modes:
+
+- `auto`: let the model decide the screenshot type.
+- `intraday_sb`: intraday chart screenshots with S/B markers.
+- `broker_records`: broker app trade record lists.
+- `watchlist_snapshot`: watchlist screenshots with stock names, codes, percent
+  changes, and latest prices.
+- `position_snapshot`: broker app position list screenshots.
+
+Private positions:
+
+- Caption Telegram photos with `持仓` to force position mode.
+- Position imports create private position rows, not public watchlist rows.
+- Position reports are owner-only and must never be broadcast to ordinary
+  Telegram subscribers.
+- Position quantity can be derived from market value when screenshots include
+  value and price but not quantity.
+- Position import uses cached stock codes and avoids slow fund lookup.
+
+Hot sector reports:
+
+- API: `POST /api/hot-sector-report`
+- Telegram owner command: `/hot_sectors`
+- Web button: `生成热点板块分析`
+- Prefer Wudao MCP tools `hot_sectors`, `theme_intraday_capital`,
+  `concept_ranking`, and `market_overview`.
+- Fall back to the older AkShare board snapshot path if Wudao fails.
+- Treat Wudao `volumeRatio` as volume/amount ratio evidence. Avoid saying
+  breadth is confirmed unless `up_ratio` is present.
+
+## 3L 20-Day Momentum Model
+
+Source PDF: `12 3.3动量模型.pdf`.
+
+Target model from the PDF:
+
+1. Use 20 trading days as the momentum period.
+2. Sort all listed A-share companies by 20-day gain.
+3. Take the top 700 stocks as the 20-day momentum pool.
+4. Exclude stocks listed for fewer than 20 days.
+5. Keep only stocks with institutional holding >= 2% or northbound holding >=
+   0.5%.
+6. Group remaining stocks by sector/industry.
+7. Compute `listed_ratio = listed_count / industry_member_count`.
+8. Compute `momentum_score = listed_count * listed_ratio`.
+9. Score > 1 means the sector has a meaningful momentum effect.
+10. Score >= 7 means the sector may be near a climax and requires volume/price
+    timing confirmation.
+
+Current implementation:
+
+- API: `POST /api/momentum-report`
+- Telegram owner command: `/momentum`
+- Web button: `生成20日动量模型`
+- Function: `generate_momentum_report()`
+- Data source: Wudao MCP.
+- Current approximation uses `stock_rank(type=gainers_20d)` plus
+  `stock_screener` to fill industry fields.
+- Wudao currently limits `stock_rank` to 200 rows, so this is a Top200
+  approximation, not the PDF's Top700 model.
+- Institutional/northbound holding filters are not enabled yet because the
+  current exposed Wudao tools do not provide those filter fields.
+- To protect Wudao free quota, do not query industry member counts one by one.
+  Use `sector_analysis(source=industry, period=20)` as a single-call source for
+  available `stockCount` values. Industries not covered by that snapshot should
+  show listed counts but should not force a momentum score.
+- The Wudao free tier is 50 calls/day and can be exhausted quickly during
+  debugging.
 
 ## Deploy And Operations
 
@@ -222,11 +308,25 @@ On cloud VPS, set `APP_HOST=0.0.0.0`, mount `./data:/app/data`, and keep
 runtime secrets in `.env`.
 
 The Docker version disables macOS local OCR by default. LM Studio/local vision is
-not expected to work on a small VPS; use a cloud vision provider later if
-screenshot recognition is required.
+not expected to work on a small VPS; use MiniMax or another cloud vision
+provider for screenshot recognition on the VPS.
+
+Current VPS notes:
+
+- Host: Tencent Cloud VPS.
+- SSH: `ssh -p 2222 -i ~/.ssh/id_ed25519 ubuntu@150.109.24.81`
+- App directory: `/home/ubuntu/apps/stockanalysis`
+- Docker service/container: `stockanalysis`
+- Web port: `8765`
 
 ## Recent Decisions And Fixes
 
+- MiniMax vision provider was added for cloud screenshot recognition.
+- Docker deployment support was added and the VPS Docker service is now the
+  practical always-on runtime.
+- Private position screenshot import and private position reports were added.
+- Position imports derive quantity from market value when possible, use cached
+  stock codes, and avoid slow fund lookup.
 - Daily reports are skipped on non-China-market trading days.
 - Reports use last valid trading report for focus review across weekends and
   holidays.
@@ -235,6 +335,9 @@ screenshot recognition is required.
   already sent, instead of requiring exact minute matching.
 - Logs are flushed for launchd visibility.
 - The macOS deploy script no longer overwrites runtime data.
+- Wudao MCP is configured and `MARKET_DATA_PROVIDER=auto` on the cloud VPS.
+- Hot sector reports use Wudao first.
+- Added `/momentum` and `/api/momentum-report` for the 3L 20-day momentum model.
 
 ## How To Continue In A New Codex Thread
 
