@@ -212,10 +212,18 @@ Current implementation:
 - Telegram owner command: `/momentum`
 - Web button: `生成20日动量模型`
 - Function: `generate_momentum_report()`
-- Data source: Wudao MCP.
-- Current approximation uses `stock_rank(type=gainers_20d)` plus
-  `stock_screener` to fill industry fields.
-- Wudao currently limits `stock_rank` to 200 rows, so this is a Top200
+- Default data source: local Tushare daily bars in SQLite
+  (`MOMENTUM_DATA_PROVIDER=tushare`).
+- Current default approximation computes 20-day gains from `daily_bars`
+  provider `tushare_raw`, corrected with `adj_factor`, then takes the Top700 and
+  groups by stock metadata. Industry grouping prefers Tushare index-classify
+  mappings (`tushare_industry`), then 同花顺行业 (`ths_industry`), then
+  `stock_basic.industry`.
+- Current VPS Tushare token can use `index_classify/index_member` with
+  `src=SW2021`; `ths_index` is not currently authorized, and
+  `index_classify(src=THS)` returned no rows.
+- Wudao MCP remains available behind `MOMENTUM_DATA_PROVIDER=wudao`, but Wudao
+  currently limits `stock_rank` to 200 rows, so that path is a Top200
   approximation, not the PDF's Top700 model.
 - Institutional/northbound holding filters are not enabled yet because the
   current exposed Wudao tools do not provide those filter fields.
@@ -225,6 +233,22 @@ Current implementation:
   show listed counts but should not force a momentum score.
 - The Wudao free tier is 50 calls/day and can be exhausted quickly during
   debugging.
+- Successful Wudao tool responses are cached in SQLite by tool name and
+  arguments. Defaults: normal tools 6 hours, `kline` 24 hours, trading calendar
+  7 days. Same-day hot-sector and momentum reports reuse the latest stored
+  report text when `WUDAO_REPORT_CACHE_ENABLED=true`.
+- To conserve quota, avoid `MARKET_DATA_PROVIDER=auto` for large watchlists
+  unless Wudao quota is sufficient; `auto` can call Wudao once per stock K-line.
+  Prefer `MARKET_DATA_PROVIDER=tushare` for daily watchlist and position reports
+  when quota is tight.
+- Tushare K-line responses are persisted in `daily_bars` with provider
+  `tushare_qfq`. `daily_bar_fetch_log` prevents repeated pulls for the same
+  stock/date/lookback window for 6 hours by default.
+- Bulk historical Tushare sync stores all-market rows as provider `tushare_raw`
+  with `adj_factor`; the momentum model computes adjusted 20-day gains as
+  `close * adj_factor`.
+- Default `MARKET_LOOKBACK_DAYS` is 260 so routine Tushare fetches retain about
+  one trading year of daily K-line data for later analysis.
 
 ## Deploy And Operations
 

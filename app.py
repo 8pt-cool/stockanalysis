@@ -2,6 +2,7 @@
 import base64
 import concurrent.futures
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -72,11 +73,36 @@ TELEGRAM_SUBSCRIBER_CHAT_IDS = os.getenv("TELEGRAM_SUBSCRIBER_CHAT_IDS", "")
 DAILY_REPORT_TIME = os.getenv("DAILY_REPORT_TIME", "15:30")
 POSITION_REPORT_TIME = os.getenv("POSITION_REPORT_TIME", "17:35")
 MARKET_DATA_PROVIDER = os.getenv("MARKET_DATA_PROVIDER", "akshare").strip().lower()
-MARKET_LOOKBACK_DAYS = int(os.getenv("MARKET_LOOKBACK_DAYS", "90"))
+MARKET_LOOKBACK_DAYS = int(os.getenv("MARKET_LOOKBACK_DAYS", "260"))
+MOMENTUM_DATA_PROVIDER = os.getenv("MOMENTUM_DATA_PROVIDER", "tushare").strip().lower()
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
 WUDAO_API_KEY = os.getenv("WUDAO_API_KEY", "")
 WUDAO_MCP_URL = os.getenv("WUDAO_MCP_URL", "https://stock.quicktiny.cn/api/mcp").strip()
 WUDAO_TIMEOUT_SECONDS = int(os.getenv("WUDAO_TIMEOUT_SECONDS", "45"))
+WUDAO_CACHE_ENABLED = os.getenv("WUDAO_CACHE_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+WUDAO_CACHE_TTL_SECONDS = int(os.getenv("WUDAO_CACHE_TTL_SECONDS", "21600"))
+WUDAO_KLINE_CACHE_TTL_SECONDS = int(os.getenv("WUDAO_KLINE_CACHE_TTL_SECONDS", "86400"))
+WUDAO_TRADING_CALENDAR_CACHE_TTL_SECONDS = int(
+    os.getenv("WUDAO_TRADING_CALENDAR_CACHE_TTL_SECONDS", "604800")
+)
+WUDAO_REPORT_CACHE_ENABLED = os.getenv("WUDAO_REPORT_CACHE_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+DAILY_BAR_CACHE_ENABLED = os.getenv("DAILY_BAR_CACHE_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+DAILY_BAR_FETCH_TTL_SECONDS = int(os.getenv("DAILY_BAR_FETCH_TTL_SECONDS", "21600"))
 LOCAL_OCR_ENABLED = os.getenv("LOCAL_OCR_ENABLED", "true").lower() in (
     "1",
     "true",
@@ -224,6 +250,70 @@ def init_db():
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS api_response_cache (
+              cache_key TEXT PRIMARY KEY,
+              provider TEXT NOT NULL,
+              tool_name TEXT NOT NULL,
+              arguments_json TEXT NOT NULL,
+              response_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_bars (
+              stock_code TEXT NOT NULL,
+              trade_date TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              open REAL,
+              high REAL,
+              low REAL,
+              close REAL,
+              pre_close REAL,
+              pct_chg REAL,
+              volume REAL,
+              amount REAL,
+              turnover_rate REAL,
+              adj_factor REAL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (stock_code, trade_date, provider)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_daily_bars_date_provider
+            ON daily_bars (trade_date, provider);
+
+            CREATE INDEX IF NOT EXISTS idx_daily_bars_code_date
+            ON daily_bars (stock_code, trade_date);
+
+            CREATE TABLE IF NOT EXISTS daily_bar_fetch_log (
+              stock_code TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              end_date TEXT NOT NULL,
+              lookback_days INTEGER NOT NULL,
+              latest_trade_date TEXT,
+              fetched_at TEXT NOT NULL,
+              PRIMARY KEY (stock_code, provider, end_date, lookback_days)
+            );
+
+            CREATE TABLE IF NOT EXISTS stock_metadata (
+              stock_code TEXT PRIMARY KEY,
+              ts_code TEXT,
+              stock_name TEXT,
+              industry TEXT,
+              ths_industry TEXT,
+              ths_index_code TEXT,
+              tushare_industry TEXT,
+              tushare_industry_src TEXT,
+              tushare_index_code TEXT,
+              market TEXT,
+              list_date TEXT,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_stock_metadata_industry
+            ON stock_metadata (industry);
+
             """
         )
         existing_columns = {
@@ -238,6 +328,27 @@ def init_db():
             conn.execute("ALTER TABLE watchlist ADD COLUMN sector_name TEXT")
         if "sector_rank" not in watch_columns:
             conn.execute("ALTER TABLE watchlist ADD COLUMN sector_rank INTEGER")
+        metadata_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(stock_metadata)")
+        }
+        if "ths_industry" not in metadata_columns:
+            conn.execute("ALTER TABLE stock_metadata ADD COLUMN ths_industry TEXT")
+        if "ths_index_code" not in metadata_columns:
+            conn.execute("ALTER TABLE stock_metadata ADD COLUMN ths_index_code TEXT")
+        if "tushare_industry" not in metadata_columns:
+            conn.execute("ALTER TABLE stock_metadata ADD COLUMN tushare_industry TEXT")
+        if "tushare_industry_src" not in metadata_columns:
+            conn.execute("ALTER TABLE stock_metadata ADD COLUMN tushare_industry_src TEXT")
+        if "tushare_index_code" not in metadata_columns:
+            conn.execute("ALTER TABLE stock_metadata ADD COLUMN tushare_index_code TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stock_metadata_ths_industry "
+            "ON stock_metadata (ths_industry)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stock_metadata_tushare_industry "
+            "ON stock_metadata (tushare_industry)"
+        )
 
 
 def row_to_dict(row):
@@ -714,7 +825,9 @@ def tushare_ts_code(stock_code):
 def is_china_market_trading_day(value):
     trade_date = str(value or today_str())
     cal_date = yyyymmdd(trade_date)
-    if wudao_available():
+    if latest_local_bar_date(trade_date, provider="tushare_raw") == trade_date:
+        return True
+    if wudao_available() and MARKET_DATA_PROVIDER in ("wudao", "auto", "wudao_auto", "wudao_tushare_akshare"):
         try:
             result = wudao_trading_day(trade_date)
             if result is not None:
@@ -749,6 +862,7 @@ def normalize_tushare_frame(frame):
             "trade_date": "日期",
             "open": "开盘",
             "close": "收盘",
+            "pre_close": "前收",
             "high": "最高",
             "low": "最低",
             "pct_chg": "涨跌幅",
@@ -764,7 +878,615 @@ def normalize_tushare_frame(frame):
     return renamed
 
 
+def load_daily_bars(stock_code, provider, start_date, end_date, min_rows=1):
+    if not DAILY_BAR_CACHE_ENABLED:
+        return None
+    try:
+        import pandas as pd
+    except ImportError:
+        return None
+    code = compact_stock_code(stock_code)
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT trade_date, open, high, low, close, pre_close, pct_chg,
+                   volume, amount, turnover_rate, adj_factor
+            FROM daily_bars
+            WHERE stock_code = ? AND provider = ?
+              AND trade_date >= ? AND trade_date <= ?
+            ORDER BY trade_date
+            """,
+            (code, provider, start_date, end_date),
+        ).fetchall()
+    if len(rows) < min_rows:
+        return None
+    records = [
+        {
+            "日期": row["trade_date"],
+            "开盘": row["open"],
+            "最高": row["high"],
+            "最低": row["low"],
+            "收盘": row["close"],
+            "前收": row["pre_close"],
+            "涨跌幅": row["pct_chg"],
+            "成交量": row["volume"],
+            "成交额": row["amount"],
+            "换手率": row["turnover_rate"],
+            "adj_factor": row["adj_factor"],
+        }
+        for row in rows
+    ]
+    return pd.DataFrame(records)
+
+
+def latest_frame_date(frame):
+    if frame is None or frame.empty or "日期" not in frame.columns:
+        return None
+    value = frame["日期"].dropna().astype(str).max()
+    return value or None
+
+
+def daily_bar_fetch_recent(stock_code, provider, end_date, lookback_days):
+    if not DAILY_BAR_CACHE_ENABLED or DAILY_BAR_FETCH_TTL_SECONDS <= 0:
+        return False
+    code = compact_stock_code(stock_code)
+    cutoff = (dt.datetime.now() - dt.timedelta(seconds=DAILY_BAR_FETCH_TTL_SECONDS)).isoformat(
+        timespec="seconds"
+    )
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT fetched_at
+            FROM daily_bar_fetch_log
+            WHERE stock_code = ? AND provider = ? AND end_date = ? AND lookback_days = ?
+              AND fetched_at >= ?
+            """,
+            (code, provider, end_date, int(lookback_days), cutoff),
+        ).fetchone()
+    return bool(row)
+
+
+def save_daily_bar_fetch_log(stock_code, provider, end_date, lookback_days, latest_trade_date):
+    if not DAILY_BAR_CACHE_ENABLED:
+        return
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO daily_bar_fetch_log
+            (stock_code, provider, end_date, lookback_days, latest_trade_date, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(stock_code, provider, end_date, lookback_days) DO UPDATE SET
+              latest_trade_date=excluded.latest_trade_date,
+              fetched_at=excluded.fetched_at
+            """,
+            (
+                compact_stock_code(stock_code),
+                provider,
+                end_date,
+                int(lookback_days),
+                latest_trade_date,
+                now_iso(),
+            ),
+        )
+
+
+def save_daily_bars(stock_code, provider, frame):
+    if not DAILY_BAR_CACHE_ENABLED or frame is None or frame.empty:
+        return
+    code = compact_stock_code(stock_code)
+    now = now_iso()
+    records = []
+    for row in frame_records(frame):
+        trade_date = str(row.get("日期") or "").strip()
+        if not trade_date:
+            continue
+        records.append(
+            (
+                code,
+                trade_date,
+                provider,
+                as_number(row.get("开盘")),
+                as_number(row.get("最高")),
+                as_number(row.get("最低")),
+                as_number(row.get("收盘")),
+                as_number(row.get("前收")),
+                as_number(row.get("涨跌幅")),
+                as_number(row.get("成交量")),
+                as_number(row.get("成交额")),
+                as_number(row.get("换手率")),
+                as_number(row.get("adj_factor")),
+                now,
+                now,
+            )
+        )
+    if not records:
+        return
+    with db() as conn:
+        conn.executemany(
+            """
+            INSERT INTO daily_bars
+            (stock_code, trade_date, provider, open, high, low, close, pre_close,
+             pct_chg, volume, amount, turnover_rate, adj_factor, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(stock_code, trade_date, provider) DO UPDATE SET
+              open=excluded.open,
+              high=excluded.high,
+              low=excluded.low,
+              close=excluded.close,
+              pre_close=excluded.pre_close,
+              pct_chg=excluded.pct_chg,
+              volume=excluded.volume,
+              amount=excluded.amount,
+              turnover_rate=excluded.turnover_rate,
+              adj_factor=excluded.adj_factor,
+              updated_at=excluded.updated_at
+            """,
+            records,
+        )
+
+
+def save_daily_bar_records(records):
+    if not DAILY_BAR_CACHE_ENABLED or not records:
+        return 0
+    now = now_iso()
+    rows = []
+    for item in records:
+        code = compact_stock_code(item.get("stock_code"))
+        trade_date = str(item.get("trade_date") or "").strip()
+        provider = str(item.get("provider") or "tushare_qfq").strip()
+        if not code or not trade_date or not provider:
+            continue
+        rows.append(
+            (
+                code,
+                trade_date,
+                provider,
+                as_number(item.get("open")),
+                as_number(item.get("high")),
+                as_number(item.get("low")),
+                as_number(item.get("close")),
+                as_number(item.get("pre_close")),
+                as_number(item.get("pct_chg")),
+                as_number(item.get("volume")),
+                as_number(item.get("amount")),
+                as_number(item.get("turnover_rate")),
+                as_number(item.get("adj_factor")),
+                now,
+                now,
+            )
+        )
+    if not rows:
+        return 0
+    with db() as conn:
+        conn.executemany(
+            """
+            INSERT INTO daily_bars
+            (stock_code, trade_date, provider, open, high, low, close, pre_close,
+             pct_chg, volume, amount, turnover_rate, adj_factor, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(stock_code, trade_date, provider) DO UPDATE SET
+              open=excluded.open,
+              high=excluded.high,
+              low=excluded.low,
+              close=excluded.close,
+              pre_close=excluded.pre_close,
+              pct_chg=excluded.pct_chg,
+              volume=excluded.volume,
+              amount=excluded.amount,
+              turnover_rate=excluded.turnover_rate,
+              adj_factor=excluded.adj_factor,
+              updated_at=excluded.updated_at
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def tushare_pro():
+    if not TUSHARE_TOKEN:
+        raise RuntimeError("Tushare 未配置：请在 .env 设置 TUSHARE_TOKEN")
+    try:
+        import tushare as ts
+    except ImportError as exc:
+        raise RuntimeError("Tushare 未安装。请运行：python3 -m pip install tushare") from exc
+    return ts.pro_api(TUSHARE_TOKEN)
+
+
+def sync_tushare_stock_metadata(force=False):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT MAX(updated_at) AS updated_at, COUNT(*) AS count FROM stock_metadata"
+        ).fetchone()
+    if (
+        not force
+        and row
+        and row["count"]
+        and row["updated_at"]
+        and row["updated_at"][:10] == today_str()
+    ):
+        return {"ok": True, "cached": True, "count": row["count"]}
+    pro = tushare_pro()
+    frame = pro.stock_basic(
+        exchange="",
+        list_status="L",
+        fields="ts_code,symbol,name,area,industry,market,list_date",
+    )
+    if frame is None or frame.empty:
+        return {"ok": False, "error": "Tushare stock_basic 未返回股票列表"}
+    now = now_iso()
+    rows = []
+    for raw in frame.to_dict(orient="records"):
+        code = compact_stock_code(raw.get("symbol") or raw.get("ts_code"))
+        if not code:
+            continue
+        list_date = str(raw.get("list_date") or "")
+        if len(list_date) == 8:
+            list_date = f"{list_date[:4]}-{list_date[4:6]}-{list_date[6:8]}"
+        rows.append(
+            (
+                code,
+                raw.get("ts_code"),
+                raw.get("name"),
+                raw.get("industry") or "未分类",
+                raw.get("market"),
+                list_date or None,
+                now,
+            )
+        )
+    with db() as conn:
+        conn.executemany(
+            """
+            INSERT INTO stock_metadata
+            (stock_code, ts_code, stock_name, industry, market, list_date, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(stock_code) DO UPDATE SET
+              ts_code=excluded.ts_code,
+              stock_name=excluded.stock_name,
+              industry=excluded.industry,
+              market=excluded.market,
+              list_date=excluded.list_date,
+              updated_at=excluded.updated_at
+            """,
+            rows,
+        )
+    return {"ok": True, "cached": False, "count": len(rows)}
+
+
+def first_present_value(mapping, names):
+    for name in names:
+        if name in mapping and mapping.get(name) not in (None, ""):
+            return mapping.get(name)
+    return None
+
+
+def sync_tushare_index_industries(src="SW2021", level="L1", force=False, sleep_seconds=0.35, max_indexes=None):
+    metadata_result = sync_tushare_stock_metadata(force=force)
+    pro = tushare_pro()
+    src = str(src or "SW2021").upper()
+    level = str(level or "L1").upper()
+    try:
+        index_frame = pro.index_classify(src=src, level=level)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "metadata": metadata_result,
+            "src": src,
+            "level": level,
+            "error": f"Tushare index_classify 失败：{exc}",
+        }
+    if index_frame is None or index_frame.empty:
+        return {
+            "ok": False,
+            "metadata": metadata_result,
+            "src": src,
+            "level": level,
+            "error": f"Tushare index_classify 未返回 {src} {level} 行业列表",
+        }
+
+    indexes = []
+    for raw in index_frame.to_dict(orient="records"):
+        index_code = first_present_value(raw, ("index_code", "ts_code", "code"))
+        name = first_present_value(raw, ("industry_name", "name", "index_name"))
+        if not index_code or not name:
+            continue
+        indexes.append({"index_code": str(index_code), "name": str(name)})
+    if max_indexes:
+        indexes = indexes[: int(max_indexes)]
+
+    updated = 0
+    index_count = 0
+    errors = []
+    now = now_iso()
+    for item in indexes:
+        index_code = item["index_code"]
+        name = item["name"]
+        try:
+            member_frame = pro.index_member(index_code=index_code, is_new="Y")
+            if member_frame is None or member_frame.empty:
+                continue
+            rows = []
+            for raw in member_frame.to_dict(orient="records"):
+                stock_code = compact_stock_code(
+                    first_present_value(
+                        raw,
+                        ("code", "con_code", "stock_code", "ts_code", "symbol"),
+                    )
+                )
+                if not stock_code or stock_code == compact_stock_code(index_code):
+                    continue
+                rows.append((name, src, index_code, now, stock_code))
+            if rows:
+                with db() as conn:
+                    conn.executemany(
+                        """
+                        UPDATE stock_metadata
+                        SET tushare_industry = ?,
+                            tushare_industry_src = ?,
+                            tushare_index_code = ?,
+                            updated_at = ?
+                        WHERE stock_code = ?
+                        """,
+                        rows,
+                    )
+                    changed = conn.total_changes
+                updated += changed
+                index_count += 1
+            if sleep_seconds:
+                time.sleep(float(sleep_seconds))
+        except Exception as exc:
+            errors.append({"index_code": index_code, "name": name, "error": str(exc)})
+            if sleep_seconds:
+                time.sleep(max(float(sleep_seconds), 1.0))
+    with db() as conn:
+        covered = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM stock_metadata
+            WHERE tushare_industry IS NOT NULL
+              AND tushare_industry != ''
+              AND tushare_industry_src = ?
+            """,
+            (src,),
+        ).fetchone()[0]
+    return {
+        "ok": not errors,
+        "metadata": metadata_result,
+        "src": src,
+        "level": level,
+        "index_count": index_count,
+        "updated": updated,
+        "covered_stocks": covered,
+        "error_count": len(errors),
+        "errors": errors[:20],
+    }
+
+
+def sync_tushare_ths_industries(force=False, sleep_seconds=0.35, max_indexes=None):
+    return sync_tushare_index_industries(
+        src="THS",
+        level="L1",
+        force=force,
+        sleep_seconds=sleep_seconds,
+        max_indexes=max_indexes,
+    )
+
+
+def normalize_trade_date(value):
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{8}", text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return text[:10]
+
+
+def synced_tushare_trade_dates(start_date, end_date):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT trade_date, COUNT(*) AS row_count
+            FROM daily_bars
+            WHERE provider = 'tushare_raw'
+              AND trade_date >= ? AND trade_date <= ?
+            GROUP BY trade_date
+            HAVING row_count >= 1000
+            ORDER BY trade_date
+            """,
+            (start_date, end_date),
+        ).fetchall()
+    return {row["trade_date"] for row in rows}
+
+
+def sync_tushare_daily_bar_history(end_date=None, lookback_days=MARKET_LOOKBACK_DAYS, sleep_seconds=0.35, max_dates=None):
+    end = dt.date.fromisoformat(end_date or today_str())
+    start = end - dt.timedelta(days=int(lookback_days) * 2)
+    start_text = start.isoformat()
+    end_text = end.isoformat()
+    metadata = sync_tushare_stock_metadata()
+    pro = tushare_pro()
+    existing_dates = synced_tushare_trade_dates(start_text, end_text)
+    synced = []
+    skipped = []
+    errors = []
+    warnings = []
+    candidates = [
+        start + dt.timedelta(days=offset)
+        for offset in range((end - start).days + 1)
+    ]
+    candidates = [day for day in candidates if day.isoformat() not in existing_dates]
+    candidates.sort(reverse=True)
+    if max_dates:
+        candidates = candidates[: int(max_dates)]
+    for day in candidates:
+        trade_date = day.strftime("%Y%m%d")
+        iso_date = day.isoformat()
+        try:
+            daily = pro.daily(trade_date=trade_date)
+            if daily is None or daily.empty:
+                skipped.append(iso_date)
+                continue
+        except Exception as exc:
+            errors.append({"date": iso_date, "error": str(exc)})
+            if sleep_seconds:
+                time.sleep(max(float(sleep_seconds), 1.0))
+            continue
+
+        adj_by_code = {}
+        try:
+            adj = pro.adj_factor(trade_date=trade_date)
+            if adj is not None and not adj.empty:
+                for row in adj.to_dict(orient="records"):
+                    adj_by_code[compact_stock_code(row.get("ts_code"))] = as_number(row.get("adj_factor"))
+        except Exception as exc:
+            warnings.append({"date": iso_date, "warning": f"adj_factor skipped: {exc}"})
+
+        records = []
+        for row in daily.to_dict(orient="records"):
+            code = compact_stock_code(row.get("ts_code"))
+            if not code:
+                continue
+            adj_factor = adj_by_code.get(code)
+            records.append(
+                {
+                    "stock_code": code,
+                    "trade_date": normalize_trade_date(row.get("trade_date") or trade_date),
+                    "provider": "tushare_raw",
+                    "open": row.get("open"),
+                    "high": row.get("high"),
+                    "low": row.get("low"),
+                    "close": row.get("close"),
+                    "pre_close": row.get("pre_close"),
+                    "pct_chg": row.get("pct_chg"),
+                    "volume": row.get("vol"),
+                    "amount": row.get("amount"),
+                    "turnover_rate": None,
+                    "adj_factor": adj_factor,
+                }
+            )
+        saved = save_daily_bar_records(records)
+        if saved:
+            synced.append({"date": iso_date, "rows": saved, "adj_factor": bool(adj_by_code)})
+        else:
+            skipped.append(iso_date)
+        if sleep_seconds:
+            time.sleep(float(sleep_seconds))
+    return {
+        "ok": not errors,
+        "start_date": start_text,
+        "end_date": end_text,
+        "metadata": metadata,
+        "synced_dates": synced,
+        "skipped_dates": skipped[:20],
+        "error_count": len(errors),
+        "errors": errors[:20],
+        "warning_count": len(warnings),
+        "warnings": warnings[:20],
+    }
+
+
+def daily_bar_dates_missing_adj(start_date=None, end_date=None, provider="tushare_raw", max_dates=None):
+    query = """
+        SELECT trade_date
+        FROM daily_bars
+        WHERE provider = ?
+          AND adj_factor IS NULL
+    """
+    params = [provider]
+    if start_date:
+        query += " AND trade_date >= ?"
+        params.append(start_date)
+    if end_date:
+        query += " AND trade_date <= ?"
+        params.append(end_date)
+    query += " GROUP BY trade_date HAVING COUNT(*) >= 1000 ORDER BY trade_date DESC"
+    if max_dates:
+        query += " LIMIT ?"
+        params.append(int(max_dates))
+    with db() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [row["trade_date"] for row in rows]
+
+
+def update_daily_bar_adj_factors(trade_date, adj_by_code, provider="tushare_raw"):
+    if not adj_by_code:
+        return 0
+    rows = [
+        (as_number(adj_factor), compact_stock_code(code), trade_date, provider)
+        for code, adj_factor in adj_by_code.items()
+        if compact_stock_code(code) and as_number(adj_factor) is not None
+    ]
+    if not rows:
+        return 0
+    with db() as conn:
+        conn.executemany(
+            """
+            UPDATE daily_bars
+            SET adj_factor = ?, updated_at = ?
+            WHERE stock_code = ? AND trade_date = ? AND provider = ?
+            """,
+            [(row[0], now_iso(), row[1], row[2], row[3]) for row in rows],
+        )
+        updated = conn.total_changes
+    return updated
+
+
+def sync_tushare_adj_factors_history(start_date=None, end_date=None, sleep_seconds=1.1, max_dates=None):
+    pro = tushare_pro()
+    dates = daily_bar_dates_missing_adj(
+        start_date=start_date,
+        end_date=end_date or today_str(),
+        provider="tushare_raw",
+        max_dates=max_dates,
+    )
+    synced = []
+    skipped = []
+    errors = []
+    for trade_date in dates:
+        try:
+            frame = pro.adj_factor(trade_date=yyyymmdd(trade_date))
+            if frame is None or frame.empty:
+                skipped.append(trade_date)
+                continue
+            adj_by_code = {
+                compact_stock_code(row.get("ts_code")): as_number(row.get("adj_factor"))
+                for row in frame.to_dict(orient="records")
+                if row.get("ts_code")
+            }
+            updated = update_daily_bar_adj_factors(trade_date, adj_by_code)
+            synced.append({"date": trade_date, "rows": updated})
+            if sleep_seconds:
+                time.sleep(float(sleep_seconds))
+        except Exception as exc:
+            errors.append({"date": trade_date, "error": str(exc)})
+            if sleep_seconds:
+                time.sleep(max(float(sleep_seconds), 1.0))
+    return {
+        "ok": not errors,
+        "start_date": start_date,
+        "end_date": end_date or today_str(),
+        "requested_dates": len(dates),
+        "synced_dates": synced,
+        "skipped_dates": skipped[:20],
+        "error_count": len(errors),
+        "errors": errors[:20],
+    }
+
+
 def fetch_tushare_daily(stock_code, end_date, lookback_days=MARKET_LOOKBACK_DAYS):
+    end = dt.date.fromisoformat(end_date)
+    start = end - dt.timedelta(days=lookback_days * 2)
+    provider = "tushare_qfq"
+    cached = load_daily_bars(
+        stock_code,
+        provider,
+        start.isoformat(),
+        end_date,
+        min_rows=1,
+    )
+    cached_latest = latest_frame_date(cached)
+    if cached is not None and (
+        cached_latest == end_date
+        or daily_bar_fetch_recent(stock_code, provider, end_date, lookback_days)
+    ):
+        return {"ok": True, "frame": cached, "provider": provider, "cached": True}
     if not TUSHARE_TOKEN:
         return {"ok": False, "error": "Tushare 未配置：请在 .env 设置 TUSHARE_TOKEN"}
     try:
@@ -774,9 +1496,6 @@ def fetch_tushare_daily(stock_code, end_date, lookback_days=MARKET_LOOKBACK_DAYS
             "ok": False,
             "error": "Tushare 未安装。请运行：python3 -m pip install tushare",
         }
-
-    end = dt.date.fromisoformat(end_date)
-    start = end - dt.timedelta(days=lookback_days * 2)
     try:
         pro = ts.pro_api(TUSHARE_TOKEN)
         frame = pro.daily(
@@ -807,7 +1526,114 @@ def fetch_tushare_daily(stock_code, end_date, lookback_days=MARKET_LOOKBACK_DAYS
             for col in ("开盘", "收盘", "最高", "最低"):
                 if col in frame.columns:
                     frame[col] = frame[col].astype(float) * ratio
-    return {"ok": True, "frame": frame, "provider": "tushare_qfq"}
+    save_daily_bars(stock_code, provider, frame)
+    save_daily_bar_fetch_log(stock_code, provider, end_date, lookback_days, latest_frame_date(frame))
+    return {"ok": True, "frame": frame, "provider": provider}
+
+
+def stable_json(value):
+    return json.dumps(
+        value or {},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def wudao_cache_ttl(tool_name):
+    if tool_name == "trading_calendar":
+        return WUDAO_TRADING_CALENDAR_CACHE_TTL_SECONDS
+    if tool_name == "kline":
+        return WUDAO_KLINE_CACHE_TTL_SECONDS
+    return WUDAO_CACHE_TTL_SECONDS
+
+
+def wudao_cache_key(tool_name, arguments):
+    raw = f"wudao:{tool_name}:{stable_json(arguments)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def wudao_cached_data(tool_name, arguments):
+    if not WUDAO_CACHE_ENABLED:
+        return None
+    key = wudao_cache_key(tool_name, arguments)
+    try:
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT response_json
+                FROM api_response_cache
+                WHERE cache_key = ? AND expires_at > ?
+                """,
+                (key, now_iso()),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    try:
+        return json.loads(row["response_json"])
+    except json.JSONDecodeError:
+        return None
+
+
+def save_wudao_cache(tool_name, arguments, data):
+    if not WUDAO_CACHE_ENABLED:
+        return
+    ttl = wudao_cache_ttl(tool_name)
+    if ttl <= 0:
+        return
+    created_at = now_iso()
+    expires_at = (dt.datetime.now() + dt.timedelta(seconds=ttl)).isoformat(timespec="seconds")
+    try:
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO api_response_cache
+                (cache_key, provider, tool_name, arguments_json, response_json, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                  response_json=excluded.response_json,
+                  created_at=excluded.created_at,
+                  expires_at=excluded.expires_at
+                """,
+                (
+                    wudao_cache_key(tool_name, arguments),
+                    "wudao",
+                    tool_name,
+                    stable_json(arguments),
+                    json.dumps(data, ensure_ascii=False, default=str),
+                    created_at,
+                    expires_at,
+                ),
+            )
+    except (sqlite3.Error, TypeError, ValueError):
+        return
+
+
+def latest_report_summary(report_date, report_type):
+    if not WUDAO_REPORT_CACHE_ENABLED:
+        return None
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT market_data_json, ai_summary
+            FROM daily_stock_reports
+            WHERE report_date = ?
+            ORDER BY created_at DESC
+            LIMIT 20
+            """,
+            (report_date,),
+        ).fetchall()
+    for row in rows:
+        try:
+            market_data = json.loads(row["market_data_json"] or "{}")
+        except Exception:
+            market_data = {}
+        if market_data.get("type") == report_type and row["ai_summary"]:
+            return row["ai_summary"]
+    return None
 
 
 def wudao_available():
@@ -881,12 +1707,19 @@ def wudao_call_tool(name, arguments=None):
 
 
 def wudao_data(tool_name, arguments=None):
+    arguments = arguments or {}
+    cached = wudao_cached_data(tool_name, arguments)
+    if cached is not None:
+        return cached
     parsed = wudao_call_tool(tool_name, arguments)
     if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict):
-        return parsed["data"]
-    if isinstance(parsed, dict):
-        return parsed
-    return {"raw": parsed}
+        data = parsed["data"]
+    elif isinstance(parsed, dict):
+        data = parsed
+    else:
+        data = {"raw": parsed}
+    save_wudao_cache(tool_name, arguments, data)
+    return data
 
 
 def wudao_trading_day(value):
@@ -2209,7 +3042,11 @@ def hot_sector_snapshot(trade_date=None, max_boards=6):
 
 
 def generate_hot_sector_report(trade_date=None):
-    snapshot = hot_sector_snapshot(trade_date)
+    report_date = previous_trading_date(trade_date or today_str())
+    cached = latest_report_summary(report_date, "hot_sector_snapshot")
+    if cached:
+        return cached
+    snapshot = hot_sector_snapshot(report_date)
     if not snapshot.get("boards"):
         return (
             f"A股热点板块分析 {snapshot.get('date')}\n\n"
@@ -2285,7 +3122,180 @@ def wudao_sector_stock_counts(trade_date):
     return counts, None
 
 
-def momentum_snapshot(trade_date=None, top_n=200):
+def local_daily_bar_dates(end_date=None, provider="tushare_raw", limit=21):
+    end_date = end_date or today_str()
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT trade_date
+            FROM daily_bars
+            WHERE provider = ? AND trade_date <= ?
+            GROUP BY trade_date
+            HAVING COUNT(*) >= 1000
+            ORDER BY trade_date DESC
+            LIMIT ?
+            """,
+            (provider, end_date, int(limit)),
+        ).fetchall()
+    return [row["trade_date"] for row in rows]
+
+
+def latest_local_bar_date(end_date=None, provider="tushare_raw"):
+    dates = local_daily_bar_dates(end_date=end_date, provider=provider, limit=1)
+    return dates[0] if dates else None
+
+
+def local_industry_totals(cutoff_date=None):
+    query = """
+        SELECT COALESCE(NULLIF(tushare_industry, ''), NULLIF(ths_industry, ''), NULLIF(industry, ''), '未分类') AS industry,
+               COUNT(*) AS count
+        FROM stock_metadata
+    """
+    params = []
+    if cutoff_date:
+        query += " WHERE list_date IS NULL OR list_date = '' OR list_date <= ?"
+        params.append(cutoff_date)
+    query += " GROUP BY COALESCE(NULLIF(tushare_industry, ''), NULLIF(ths_industry, ''), NULLIF(industry, ''), '未分类')"
+    with db() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return {row["industry"]: row["count"] for row in rows}
+
+
+def local_momentum_snapshot(trade_date=None, top_n=700, period_days=20):
+    end_date = latest_local_bar_date(trade_date or today_str(), provider="tushare_raw")
+    if not end_date:
+        return {
+            "type": "momentum_snapshot",
+            "ok": False,
+            "date": trade_date or today_str(),
+            "source": "local_tushare_daily_bars",
+            "error": "本地 daily_bars 尚无 tushare_raw 日线数据，请先同步历史 K 线。",
+        }
+    dates = local_daily_bar_dates(end_date=end_date, provider="tushare_raw", limit=period_days + 1)
+    if len(dates) < period_days + 1:
+        return {
+            "type": "momentum_snapshot",
+            "ok": False,
+            "date": end_date,
+            "source": "local_tushare_daily_bars",
+            "error": f"本地 tushare_raw 交易日不足 {period_days + 1} 天，当前只有 {len(dates)} 天。",
+        }
+    start_date = dates[-1]
+    requested_top_n = int(top_n or 700)
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+              latest.stock_code,
+              COALESCE(meta.stock_name, latest.stock_code) AS stock_name,
+              COALESCE(NULLIF(meta.tushare_industry, ''), NULLIF(meta.ths_industry, ''), NULLIF(meta.industry, ''), '未分类') AS industry,
+              latest.close AS latest_close,
+              latest.adj_factor AS latest_adj_factor,
+              latest.amount AS amount,
+              start.close AS start_close,
+              start.adj_factor AS start_adj_factor,
+              meta.list_date
+            FROM daily_bars latest
+            JOIN daily_bars start
+              ON start.stock_code = latest.stock_code
+             AND start.provider = latest.provider
+             AND start.trade_date = ?
+            LEFT JOIN stock_metadata meta
+              ON meta.stock_code = latest.stock_code
+            WHERE latest.provider = 'tushare_raw'
+              AND latest.trade_date = ?
+              AND latest.close IS NOT NULL
+              AND start.close IS NOT NULL
+              AND latest.close > 0
+              AND start.close > 0
+              AND (meta.list_date IS NULL OR meta.list_date = '' OR meta.list_date <= ?)
+            """,
+            (start_date, end_date, start_date),
+        ).fetchall()
+    stocks = []
+    for row in rows:
+        latest_close = as_number(row["latest_close"])
+        start_close = as_number(row["start_close"])
+        latest_adj = as_number(row["latest_adj_factor"]) or 1.0
+        start_adj = as_number(row["start_adj_factor"]) or 1.0
+        if latest_close is None or start_close in (None, 0):
+            continue
+        latest_adjusted = latest_close * latest_adj
+        start_adjusted = start_close * start_adj
+        if start_adjusted <= 0:
+            continue
+        change_percent = round((latest_adjusted - start_adjusted) / start_adjusted * 100, 4)
+        stocks.append(
+            {
+                "code": row["stock_code"],
+                "name": row["stock_name"],
+                "industry": row["industry"] or "未分类",
+                "rank_change_percent": change_percent,
+                "close": latest_close,
+                "amount_yi": round((as_number(row["amount"]) or 0) / 100000, 4)
+                if row["amount"] is not None
+                else None,
+            }
+        )
+    stocks.sort(key=lambda item: item.get("rank_change_percent") or -999999, reverse=True)
+    selected = stocks[:requested_top_n]
+    for index, stock in enumerate(selected, 1):
+        stock["rank"] = index
+
+    groups = {}
+    for row in selected:
+        groups.setdefault(row["industry"], []).append(row)
+    industry_totals = local_industry_totals(start_date)
+    sectors = []
+    for industry, items in groups.items():
+        listed = len(items)
+        total = industry_totals.get(industry)
+        listed_ratio = round(listed / total, 4) if total else None
+        score = round(listed * listed_ratio, 4) if listed_ratio is not None else None
+        sectors.append(
+            {
+                "industry": industry,
+                "listed_count": listed,
+                "member_count": total,
+                "listed_ratio": listed_ratio,
+                "momentum_score": score,
+                "avg_rank": mean([item.get("rank") for item in items]),
+                "leaders": sorted(items, key=lambda item: item.get("rank") or 999999)[:5],
+            }
+        )
+    sectors.sort(
+        key=lambda item: (
+            item.get("momentum_score") is not None,
+            item.get("momentum_score") or -999,
+            item.get("listed_count") or 0,
+        ),
+        reverse=True,
+    )
+    for index, sector in enumerate(sectors, 1):
+        sector["rank"] = index
+
+    return {
+        "type": "momentum_snapshot",
+        "ok": True,
+        "date": end_date,
+        "start_date": start_date,
+        "source": "local_tushare_daily_bars",
+        "period_days": period_days,
+        "requested_top_n": requested_top_n,
+        "actual_top_n": len(selected),
+        "limitations": [
+            "当前使用 Tushare 本地日线与本地行业映射计算，为 Top700 近似版；行业优先使用 Tushare index_classify 映射。",
+            "20 日涨幅优先使用 close * adj_factor 修正除权影响；如果 adj_factor 尚未同步，则退化为未复权 close 近似。",
+            "机构持股 >=2% 或北向持股 >=0.5% 过滤暂未启用。",
+            "行业成分总数来自本地 stock_metadata，中信/申万/同花顺等更细行业口径后续可替换。",
+        ],
+        "errors": [],
+        "stock_count": len(selected),
+        "sectors": sectors,
+    }
+
+
+def wudao_momentum_snapshot(trade_date=None, top_n=200):
     if not wudao_available():
         return {
             "type": "momentum_snapshot",
@@ -2424,6 +3434,15 @@ def momentum_snapshot(trade_date=None, top_n=200):
     }
 
 
+def momentum_snapshot(trade_date=None, top_n=None):
+    if MOMENTUM_DATA_PROVIDER in ("wudao", "wudao_mcp"):
+        return wudao_momentum_snapshot(trade_date, top_n or 200)
+    local = local_momentum_snapshot(trade_date, top_n or 700)
+    if local.get("ok") or MOMENTUM_DATA_PROVIDER in ("tushare", "local", "local_tushare"):
+        return local
+    return wudao_momentum_snapshot(trade_date, 200)
+
+
 def format_percent(value):
     if value is None:
         return "缺失"
@@ -2437,7 +3456,12 @@ def format_signed_pct(value):
 
 
 def generate_momentum_report(trade_date=None):
-    snapshot = momentum_snapshot(trade_date)
+    requested_date = trade_date or today_str()
+    report_date = latest_local_bar_date(requested_date, provider="tushare_raw") or requested_date
+    cached = latest_report_summary(report_date, "momentum_snapshot")
+    if cached:
+        return cached
+    snapshot = momentum_snapshot(report_date)
     if not snapshot.get("ok"):
         return f"20日动量模型\n\n生成失败：{snapshot.get('error') or '未知错误'}"
     date = snapshot.get("date")
@@ -2449,19 +3473,26 @@ def generate_momentum_report(trade_date=None):
         f"20日动量模型 {date}",
         "",
         "模型口径：",
-        f"- 取全市场 20 日涨幅榜前 {snapshot.get('actual_top_n')} 只，按行业聚合。",
-        "- 动量分值 = 上榜数量 x 上榜占比；上榜占比 = 上榜数量 / 行业成分总数。",
-        "- 分值 > 1 视为具备板块效应；分值 >= 7 视为接近高潮，需要结合量价择时谨慎判断。",
-        "- 当前为悟道 Top200 近似版，暂未启用机构/北向持仓过滤。",
-        "",
-        "动量排名：",
     ]
+    if snapshot.get("start_date"):
+        lines.append(f"- 计算区间：{snapshot.get('start_date')} 至 {date}。")
+    lines.extend(
+        [
+            f"- 取全市场 20 日涨幅榜前 {snapshot.get('actual_top_n')} 只，按行业聚合。",
+            "- 动量分值 = 上榜数量 x 上榜占比；上榜占比 = 上榜数量 / 行业成分总数。",
+            "- 分值 > 1 视为具备板块效应；分值 >= 7 视为接近高潮，需要结合量价择时谨慎判断。",
+            f"- 数据源：{snapshot.get('source')}，暂未启用机构/北向持仓过滤。",
+        ]
+    )
+    for limitation in (snapshot.get("limitations") or [])[:4]:
+        lines.append(f"- {limitation}")
+    lines.extend(["", "动量排名："])
     if not valid_sectors:
         lines.append("没有生成可排序的行业动量数据。")
     for sector in valid_sectors[:12]:
         leaders = "、".join(
             [
-                f"{item.get('name')}({item.get('code')}, 榜单#{item.get('rank')}, 当日{format_signed_pct(item.get('rank_change_percent'))})"
+                f"{item.get('name')}({item.get('code')}, 榜单#{item.get('rank')}, 20日{format_signed_pct(item.get('rank_change_percent'))})"
                 for item in (sector.get("leaders") or [])[:3]
             ]
         )
@@ -2492,7 +3523,7 @@ def generate_momentum_report(trade_date=None):
             )
         )
     else:
-        lines.append("当前 Top200 口径下，没有分值大于 1 的明确动量主线。")
+        lines.append("当前口径下，没有分值大于 1 的明确动量主线。")
     if climax:
         lines.append(
             "高潮警戒方向："
@@ -4105,6 +5136,80 @@ class AppHandler(BaseHTTPRequestHandler):
             if self.path == "/api/momentum-report":
                 trade_date = payload.get("date") or payload.get("report_date") or today_str()
                 json_response(self, {"ok": True, "report": generate_momentum_report(trade_date)})
+                return
+            if self.path == "/api/sync-daily-bars":
+                end_date = payload.get("date") or payload.get("end_date") or today_str()
+                lookback_days = as_int(payload.get("lookback_days")) or MARKET_LOOKBACK_DAYS
+                max_dates = as_int(payload.get("max_dates"))
+                sleep_seconds = as_number(payload.get("sleep_seconds"))
+                if sleep_seconds is None:
+                    sleep_seconds = 0.35
+                json_response(
+                    self,
+                    {
+                        "ok": True,
+                        "sync": sync_tushare_daily_bar_history(
+                            end_date=end_date,
+                            lookback_days=lookback_days,
+                            sleep_seconds=sleep_seconds,
+                            max_dates=max_dates,
+                        ),
+                    },
+                )
+                return
+            if self.path == "/api/sync-adj-factors":
+                max_dates = as_int(payload.get("max_dates"))
+                sleep_seconds = as_number(payload.get("sleep_seconds"))
+                if sleep_seconds is None:
+                    sleep_seconds = 1.1
+                json_response(
+                    self,
+                    {
+                        "ok": True,
+                        "sync": sync_tushare_adj_factors_history(
+                            start_date=payload.get("start_date"),
+                            end_date=payload.get("date") or payload.get("end_date"),
+                            sleep_seconds=sleep_seconds,
+                            max_dates=max_dates,
+                        ),
+                    },
+                )
+                return
+            if self.path == "/api/sync-ths-industries":
+                max_indexes = as_int(payload.get("max_indexes"))
+                sleep_seconds = as_number(payload.get("sleep_seconds"))
+                if sleep_seconds is None:
+                    sleep_seconds = 0.35
+                json_response(
+                    self,
+                    {
+                        "ok": True,
+                        "sync": sync_tushare_ths_industries(
+                            force=bool(payload.get("force")),
+                            sleep_seconds=sleep_seconds,
+                            max_indexes=max_indexes,
+                        ),
+                    },
+                )
+                return
+            if self.path == "/api/sync-tushare-industries":
+                max_indexes = as_int(payload.get("max_indexes"))
+                sleep_seconds = as_number(payload.get("sleep_seconds"))
+                if sleep_seconds is None:
+                    sleep_seconds = 0.35
+                json_response(
+                    self,
+                    {
+                        "ok": True,
+                        "sync": sync_tushare_index_industries(
+                            src=payload.get("src") or "SW2021",
+                            level=payload.get("level") or "L1",
+                            force=bool(payload.get("force")),
+                            sleep_seconds=sleep_seconds,
+                            max_indexes=max_indexes,
+                        ),
+                    },
+                )
                 return
             if self.path == "/api/import-screenshot-trades":
                 json_response(self, {"ok": True, **import_screenshot_trades(payload)})

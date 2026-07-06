@@ -57,9 +57,17 @@ TELEGRAM_SUBSCRIBER_CHAT_IDS=
 DAILY_REPORT_TIME=17:30
 
 MARKET_DATA_PROVIDER=tushare
-MARKET_LOOKBACK_DAYS=90
+MARKET_LOOKBACK_DAYS=260
+MOMENTUM_DATA_PROVIDER=tushare
 WUDAO_API_KEY=
 WUDAO_MCP_URL=https://stock.quicktiny.cn/api/mcp
+WUDAO_CACHE_ENABLED=true
+WUDAO_CACHE_TTL_SECONDS=21600
+WUDAO_KLINE_CACHE_TTL_SECONDS=86400
+WUDAO_TRADING_CALENDAR_CACHE_TTL_SECONDS=604800
+WUDAO_REPORT_CACHE_ENABLED=true
+DAILY_BAR_CACHE_ENABLED=true
+DAILY_BAR_FETCH_TTL_SECONDS=21600
 ```
 
 Set `TEXT_AI_PROVIDER=deepseek` to use DeepSeek for text reviews and reports.
@@ -116,7 +124,8 @@ stored with `sector_name` and `sector_rank`. Use `/sector` in Telegram or
 weak-but-stabilizing subsectors and low-absorption watch candidates.
 
 Use `/momentum` in Telegram or `POST /api/momentum-report` to generate the
-20-day 3L momentum model based on the Wudao A-share data source.
+20-day 3L momentum model. By default it uses local Tushare daily bars stored in
+SQLite and does not consume Wudao quota.
 
 For Telegram photo uploads, add a caption to force the mode:
 
@@ -159,6 +168,29 @@ With `MARKET_DATA_PROVIDER=wudao`, trade reviews fetch front-adjusted daily
 K-line data from the Wudao A-share MCP and fall back to Tushare, then AKShare.
 With `MARKET_DATA_PROVIDER=auto`, the app tries Wudao first, then Tushare, then
 AKShare. Hot sector reports automatically try Wudao when `WUDAO_API_KEY` is set.
+
+Wudao has daily quota limits. The app caches successful Wudao tool responses in
+SQLite by default: normal tools for 6 hours, K-line responses for 24 hours, and
+trading-calendar checks for 7 days. Re-running the same hot-sector or momentum
+report for the same trading day reuses the stored report text instead of calling
+Wudao again. If quota is tight, keep `MARKET_DATA_PROVIDER=tushare` for normal
+per-stock reports and reserve Wudao for `/hot_sectors` and `/momentum`.
+
+Successful Tushare K-line responses are also persisted to SQLite in
+`daily_bars`. For the same stock/date/lookback window, the app reuses local bars
+after a recent fetch attempt, even if the upstream data has not updated to the
+requested report date yet. `DAILY_BAR_FETCH_TTL_SECONDS` controls that retry
+window and defaults to 6 hours. The default `MARKET_LOOKBACK_DAYS=260` keeps
+about one trading year of daily bars available for later analysis.
+
+The 20-day momentum model defaults to `MOMENTUM_DATA_PROVIDER=tushare`: it uses
+`daily_bars` rows from the `tushare_raw` provider plus local stock metadata to
+compute the Top700 industry momentum pool locally. Industry grouping prefers
+Tushare index-classify mappings (`tushare_industry`), then 同花顺行业
+(`ths_industry`), then `stock_basic.industry`. The current VPS token can use
+`SW2021`; Tushare `THS`/`ths_index` requires additional interface access. Set
+`MOMENTUM_DATA_PROVIDER=wudao` only when Wudao quota is available and the older
+Wudao Top200 approximation is desired.
 
 The app calculates:
 
