@@ -39,10 +39,10 @@ data/uploads/
 data/logs/
 ```
 
-The source repo lives under:
+The current Codex source repo on this Mac lives under:
 
 ```text
-/Users/charleszhang/Documents/Codex/2026-06-03/new-chat/outputs/trade-review-app
+/Users/charleszhang/Documents/Codex/2026-07-06/8pt-cool-stockanalysis-git-https-github/work/stockanalysis
 ```
 
 The macOS launchd service is:
@@ -64,13 +64,18 @@ Current intended configuration:
 ```text
 TEXT_AI_PROVIDER=deepseek
 VISION_AI_PROVIDER=minimax
-MARKET_DATA_PROVIDER=auto
+MARKET_DATA_PROVIDER=tushare
+MOMENTUM_DATA_PROVIDER=tushare
+MARKET_LOOKBACK_DAYS=260
 DAILY_REPORT_TIME=17:30
 POSITION_REPORT_TIME=17:35
 ```
 
 DeepSeek is used for text reviews and daily reports.
-Market data tries Wudao A-share MCP first, then Tushare, then AKShare.
+Market data should prefer Tushare on the VPS because Wudao has a tight daily
+call limit. Wudao remains useful for hot-sector tools and explicit fallback
+paths, but avoid `MARKET_DATA_PROVIDER=auto` for large watchlists unless quota
+is known to be sufficient.
 MiniMax is the intended cloud vision provider for screenshot recognition on the
 VPS. Local LM Studio can still be used for vision/screenshot recognition on the
 Mac runtime, but it is too slow and is not available on the small VPS.
@@ -249,6 +254,20 @@ Current implementation:
   `close * adj_factor`.
 - Default `MARKET_LOOKBACK_DAYS` is 260 so routine Tushare fetches retain about
   one trading year of daily K-line data for later analysis.
+- On the VPS, one year of Tushare daily bars has been backfilled:
+  `tushare_raw` has 1,476,790 rows covering 271 trading days from 2025-05-26
+  through 2026-07-06, with `adj_factor` filled for every row.
+- Tushare `index_classify/index_member` with `src=SW2021` has been synced on
+  the VPS: 31 level-1 industries and 5,197 covered stocks. 同花顺 industry data
+  is not currently usable with the active token because `ths_index` is not
+  authorized and `index_classify(src=THS)` returned no rows.
+- Latest verified local Tushare momentum report for 2026-07-06 produced these
+  leading industries: 电子, 医药生物, 机械设备, 基础化工, 非银金融, 有色金属,
+  国防军工, 电力设备.
+- Sync APIs:
+  `POST /api/sync-daily-bars`,
+  `POST /api/sync-ths-industries`,
+  `POST /api/sync-tushare-industries`.
 
 ## Deploy And Operations
 
@@ -338,10 +357,14 @@ provider for screenshot recognition on the VPS.
 Current VPS notes:
 
 - Host: Tencent Cloud VPS.
-- SSH: `ssh -p 2222 -i ~/.ssh/id_ed25519 ubuntu@150.109.24.81`
+- SSH: `ssh -p 2222 -i ~/.ssh/id_ed25519_stockanalysis_vps ubuntu@150.109.24.81`
 - App directory: `/home/ubuntu/apps/stockanalysis`
 - Docker service/container: `stockanalysis`
 - Web port: `8765`
+- Docker commands require `sudo` for this user.
+- Deploy from this Mac with `scp -P 2222 -i ~/.ssh/id_ed25519_stockanalysis_vps`
+  followed by `sudo docker compose up -d --build` on the VPS.
+- Do not print the VPS `.env`; it contains live service tokens.
 
 ## Recent Decisions And Fixes
 
@@ -359,9 +382,23 @@ Current VPS notes:
   already sent, instead of requiring exact minute matching.
 - Logs are flushed for launchd visibility.
 - The macOS deploy script no longer overwrites runtime data.
-- Wudao MCP is configured and `MARKET_DATA_PROVIDER=auto` on the cloud VPS.
+- Wudao MCP is configured on the cloud VPS, but it should not be the default
+  high-volume market data provider while quota is tight.
 - Hot sector reports use Wudao first.
 - Added `/momentum` and `/api/momentum-report` for the 3L 20-day momentum model.
+- The VPS now primarily uses Tushare for routine K-line and momentum work:
+  `MARKET_DATA_PROVIDER=tushare`, `MOMENTUM_DATA_PROVIDER=tushare`,
+  `MARKET_LOOKBACK_DAYS=260`.
+- Added SQLite caching for Wudao API responses and same-day hot-sector/momentum
+  report reuse to protect the free Wudao quota.
+- Added local SQLite persistence for Tushare K-lines in `daily_bars` and fetch
+  throttling in `daily_bar_fetch_log`.
+- Added all-market historical Tushare daily-bar sync with `adj_factor`, and the
+  momentum model now computes 20-day gains from local adjusted closes.
+- Added Tushare industry metadata sync using `index_classify/index_member`;
+  SW2021 is the working industry taxonomy for now.
+- GitHub credential helper is configured with `osxkeychain`, and pushing to the
+  GitHub repo has been verified from this Mac.
 
 ## How To Continue In A New Codex Thread
 
